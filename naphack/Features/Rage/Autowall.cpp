@@ -515,10 +515,10 @@ bool Autowall::HandleBulletPenetration( FireBulletData *data ) {
 		if( data->m_flCurrentDamage < 1.0f )
 			return true;
 
-		// как в CCSPlayer::HandleBulletPenetration: толщина стенки идёт в пройденный путь,
-		// а оставшаяся дальность пули после прострела делится пополам
+		// у Valve flDistance/flCurrentDistance передаются по значению, поэтому
+		// "m_flMaxLength = ( m_flMaxLength - m_flTraceLength ) * 0.5" не имеет эффекта.
+		// оставляем путь накопление: FireBullets сам считает остаток как дальность минус путь.
 		data->m_flTraceLength += ( ExitTrace.endpos - data->m_EnterTrace.endpos ).Length( );
-		data->m_flMaxLength = ( data->m_flMaxLength - data->m_flTraceLength ) * 0.5f;
 
 		// penetration was successful
 		// setup new start end parameters for successive trace
@@ -561,10 +561,8 @@ bool Autowall::HandleBulletPenetration( FireBulletData *data ) {
 		// reduce damage power each time we hit something other than a grate
 		data->m_flCurrentDamage *= flDamageModifier;
 
-		// как в CCSPlayer::HandleBulletPenetration: толщина стенки идёт в пройденный путь,
-		// а оставшаяся дальность пули после прострела делится пополам
+		// у Valve деления дальности пополам нет (см. выше), только накопление пути.
 		data->m_flTraceLength += ( ExitTrace.endpos - data->m_EnterTrace.endpos ).Length( );
-		data->m_flMaxLength = ( data->m_flMaxLength - data->m_flTraceLength ) * 0.5f;
 
 		// penetration was successful
 		// setup new start end parameters for successive trace

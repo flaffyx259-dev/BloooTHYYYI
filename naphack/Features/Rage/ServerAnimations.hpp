@@ -81,6 +81,11 @@ public:
 	std::array<C_AnimationLayer, 13> m_pPrevAnimOverlays;
 	bool m_bHoldingSpace;
 
+	// предсказанный серверный LBY ( сетевой приходит с задержкой RTT ).
+	float m_flPredictedLBY = 0.f;
+	bool  m_bPredictedLBYValid = false;
+	float m_flLBYMismatchSince = -1.f;
+
 	AnimationInfo_t m_uServerAnimations;
 	AnimationInfo_t m_uVisualAnimations;
 	AnimationInfo_t m_uRenderAnimations;

@@ -88,11 +88,6 @@ bool FakeLag::ShouldFakeLag( Encrypted_t<CUserCmd> pCmd ) {
 			bReturnValue = true;
 	}
 
-	if( g_Vars.rage.fake_lag_peeking ) {
-		if( g_Movement.m_bPeeking )
-			bReturnValue = false;
-	}
-
 	if( !g_Movement.PressingMovementKeys( pCmd.Xor( ) ) && pLocal->m_vecVelocity( ).Length2D( ) <= flVelocityEpsilon && pLocal->m_fFlags( ) & FL_ONGROUND ) {
 		if( ( ( TICKS_TO_TIME( pLocal->m_nTickBase( ) ) + ( g_pGlobalVars->interval_per_tick * 2 ) ) > g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer ) ) {
 			bReturnValue = false;
@@ -112,74 +107,71 @@ int FakeLag::DetermineFakeLagAmount( Encrypted_t<CUserCmd> pCmd ) {
 	if( !pLocal )
 		return 0;
 
-	bool bRunningDesync = false;
 	static bool bDesyncLand;
+
 	const bool bForceDesync = g_Vars.rage.anti_aim_desync_land_force && g_Vars.rage.anti_aim_desync_land_key.enabled;
 	const bool bDesyncing = g_Vars.rage.anti_aim_desync_land_first || bForceDesync;
 
-
 	auto pUnpredictedData = g_Prediction.get_initial_vars( );
 	if( pUnpredictedData && bDesyncing ) {
-		// we don't want to actually modify our real netvars
 		Vector vecOrigin = pLocal->m_vecOrigin( ), vecVelocity = pLocal->m_vecVelocity( );
 		int fPredictedFlags = pLocal->m_fFlags( );
 
-		// simulate two movement ticks
-		for( int i = 0; i < 2; ++i ) {
+		for( int i = 0; i < 2; ++i )
 			g_Movement.PlayerMove( pLocal, vecOrigin, vecVelocity, fPredictedFlags, pUnpredictedData->flags & FL_ONGROUND );
-		}
 
-		if( bDesyncLand ) {
-			bRunningDesync = true;
+		if( bDesyncLand )
 			bDesyncLand = false;
-		}
 
-		if( pLocal->m_fFlags( ) != fPredictedFlags ) {
-			bRunningDesync = true;
+		// приземление = в предсказании появился FL_ONGROUND
+		if( !( pLocal->m_fFlags( ) & FL_ONGROUND ) && ( fPredictedFlags & FL_ONGROUND ) )
 			bDesyncLand = true;
-		}
 	}
 
-	const auto ApplyType = [&] ( int iLagAmount ) {
-		const float extrapolated_speed = pLocal->m_vecVelocity( ).Length( ) * g_pGlobalVars->interval_per_tick;
-		switch( g_Vars.rage.fake_lag_type ) {
-			case 0: // max
-			case 3:
-				break;
-			case 1: // dyn
-				iLagAmount = std::min< int >( static_cast< int >( std::ceilf( 64 / extrapolated_speed ) ), static_cast< int >( iLagAmount ) );
-				iLagAmount = std::clamp( iLagAmount, 2, m_iLagLimit );
-				break;
-			case 2: // fluc
-				if( !bDesyncLand ) {
-					if( pCmd->tick_count % 40 < 20 ) {
-						iLagAmount = iLagAmount;
-					}
-					else {
-						iLagAmount = 2;
-					}
-				}
+	// движок не даёт чокать больше 14 ( см. "14 -> 16" в HandleFakeLag ).
+	const int nLimit = std::max( 1, std::min( m_iLagLimit, 14 ) );
 
-				break;
-		}
-
-		return iLagAmount;
-	};
+	// сколько команд чокать, чтобы сдвиг между записями сервера был > 64 юнитов:
+	// BacktrackEntity ( delta.LengthSqr( ) > 64 * 64 ) считает это телепортом -> по истории
+	// не стрельнуть, только экстраполяцией. в пакете choke + 1 команд, ceil = запас 1 тик.
+	const float flUnitsPerTick = pLocal->m_vecVelocity( ).Length( ) * g_pGlobalVars->interval_per_tick;
+	const int nBreakLC = flUnitsPerTick > 0.1f ? static_cast< int >( std::ceilf( 64.f / flUnitsPerTick ) ) : 999;
+	const bool bCanBreakLC = nBreakLC <= nLimit;
 
 	int iLagAmount = g_Vars.rage.fake_lag_amount;
+	if( g_TickbaseController.m_bShifting )
+		iLagAmount = std::clamp( iLagAmount, 0, 14 );
 
-	// TROLLER??
-	if( g_TickbaseController.m_bShifting ) {
-		iLagAmount = std::clamp<int>( iLagAmount, 0, 14 );
-	}
-
-	// this will fakelag for 14 ticks, and the choke cycle will end 4 ticks before the lby update 
-	if( const int nBodyBreak = BreakDuringBodyTimer( pCmd ); nBodyBreak > 0 ) {
-		//printf( "before %i\n", nTicksLeftTillUpdate );
+	if( const int nBodyBreak = BreakDuringBodyTimer( pCmd ); nBodyBreak > 0 )
 		iLagAmount = nBodyBreak == 1 ? 14 : 6;
+
+	switch( g_Vars.rage.fake_lag_type ) {
+		case 0: // max
+			break;
+		case 1: // dyn: ровно столько, сколько нужно для слома lagcomp
+			if( bCanBreakLC )
+				iLagAmount = std::min( iLagAmount, nBreakLC );
+			iLagAmount = std::max( iLagAmount, std::min( 2, nLimit ) );
+			break;
+		case 2: // fluc
+			if( !bDesyncLand )
+				iLagAmount = ( pCmd->tick_count % 40 < 20 ) ? iLagAmount : 2;
+			break;
+		case 3: { // adaptive
+			// нижняя граница - слом lagcomp, длина каждого цикла СЛУЧАЙНАЯ. экстраполяция
+			// делит прошедшие тики на прошлый чок -> при разных циклах она ждёт не тот
+			// апдейт и ставит точку не туда ( на 250 ед/с разница в 6 тиков = ~23 юнита ).
+			const int nMin = std::clamp( bCanBreakLC ? nBreakLC : nLimit, std::min( 2, nLimit ), nLimit );
+			iLagAmount = RandomInt( nMin, nLimit );
+
+			// два одинаковых цикла подряд - снова предсказуемо
+			for( int i = 0; i < 3 && iLagAmount == m_iLastCycleChoke && nMin < nLimit; ++i )
+				iLagAmount = RandomInt( nMin, nLimit );
+			break;
+		}
 	}
 
-	return ApplyType( iLagAmount );
+	return std::clamp( iLagAmount, 1, nLimit );
 }
 
 void FakeLag::HandleFakeLag( Encrypted_t<bool> bSendPacket, Encrypted_t<CUserCmd> pCmd ) {
@@ -200,6 +192,8 @@ void FakeLag::HandleFakeLag( Encrypted_t<bool> bSendPacket, Encrypted_t<CUserCmd
 	bool bDisable = ( fabsf( g_pGlobalVars->realtime - g_TickbaseController.m_flLastExploitTime ) < 0.2f ) && g_Vars.rage.exploit && g_Vars.rage.double_tap_bind.enabled && !g_TickbaseController.m_bDisabledFakelag && !g_TickbaseController.m_bShifting && !g_TickbaseController.m_bTapShot;
 
 	if( !g_Vars.rage.fake_lag || bDisable ) {
+		m_iAwaitingChoke = 1;
+
 		if( !g_Vars.globals.m_bFakeWalking ) {
 			if( bDisable ) {
 				m_iAwaitingChoke = 1;
@@ -234,10 +228,38 @@ void FakeLag::HandleFakeLag( Encrypted_t<bool> bSendPacket, Encrypted_t<CUserCmd
 
 	m_iAwaitingChoke = 1;
 
-	if( ShouldFakeLag( pCmd ) ) {
-		m_iAwaitingChoke = DetermineFakeLagAmount( pCmd );
+	const int nChoked = g_pClientState->m_nChokedCommands( );
 
+	// пик ( IsPeekingEx: сейчас не попадаем, через 4 тика попадём ). пока мы ещё за стеной,
+	// отправляем пакет - последняя запись у сервера и противника "за стеной", - а следующий
+	// цикл максимальный: выход из-за угла противник увидит позже всего.
+	const bool bPeekStart = g_Vars.rage.fake_lag_peeking && g_Movement.m_bPeeking && !m_bWasPeeking;
+	m_bWasPeeking = g_Movement.m_bPeeking;
+
+	if( bPeekStart )
+		m_bForceMaxNext = true;
+
+	if( bPeekStart && nChoked > 0 ) {
+		*bSendPacket.Xor( ) = true; // сброс цикла, пока нас не видно
+	}
+	else if( ShouldFakeLag( pCmd ) || m_bForceMaxNext ) {
+		// длина цикла выбирается ОДИН раз, на первой команде, и держится до отправки.
+		if( nChoked == 0 ) {
+			m_iLastCycleChoke = m_iCycleChoke;
+			m_iCycleChoke = m_bForceMaxNext ? std::max( 1, std::min( m_iLagLimit, 14 ) ) : DetermineFakeLagAmount( pCmd );
+			m_bForceMaxNext = false;
+		}
+
+		m_iAwaitingChoke = m_iCycleChoke;
 		*bSendPacket.Xor( ) = false;
+	}
+
+	// стоя AntiAim всё равно шлёт пачки по 2 ( RAX ). держим чок в согласии с ним,
+	// иначе UpdateArrivalTick считает прибытие наших команд на ~12 тиков позже.
+	if( g_Vars.rage.anti_aim_active && ( pLocal->m_fFlags( ) & FL_ONGROUND ) &&
+		pLocal->m_PlayerAnimState( )->m_flVelocityLengthXY <= 0.1f && !g_Vars.globals.m_bRunningExploit ) {
+		m_iAwaitingChoke = m_iCycleChoke = 1;
+		*bSendPacket.Xor( ) = nChoked >= 1;
 	}
 
 	m_iAwaitingChoke = std::max( m_iAwaitingChoke, 1 );

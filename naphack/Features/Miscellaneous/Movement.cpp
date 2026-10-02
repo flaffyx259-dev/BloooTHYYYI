@@ -973,46 +973,62 @@ void Movement::FakeDuck( bool *bSendPacket, CUserCmd *cmd, bool bForce ) {
 
 	cmd->buttons &= ~IN_SPEED;
 
-	auto vecPredictedVelocity = pLocal->m_vecVelocity( );
-	int nTicksToStop;
-	for( nTicksToStop = 0; nTicksToStop < g_Vars.sv_maxusrcmdprocessticks->GetInt( ) - 2; ++nTicksToStop ) {
-		if( vecPredictedVelocity.Length2D( ) < 0.1f )
-			break;
+	const float flDt = g_pGlobalVars->interval_per_tick;
+	const float flSpeed = pLocal->m_vecVelocity( ).Length2D( );
 
-		// predict velocity into the future
-		if( vecPredictedVelocity.Length( ) >= 0.1f ) {
-			const float flSpeedToStop = std::max< float >( vecPredictedVelocity.Length( ), g_Vars.sv_stopspeed->GetFloat( ) );
-			const float flStopTime = std::max< float >( g_pGlobalVars->interval_per_tick, g_pGlobalVars->frametime );
-			vecPredictedVelocity *= std::max< float >( 0.f, vecPredictedVelocity.Length( ) - g_Vars.sv_friction->GetFloat( ) * flSpeedToStop * flStopTime / vecPredictedVelocity.Length( ) );
+	// разгон и встречный стрейф ( InstantStop -> StopToSpeed ) - один и тот же
+	// CCSGameMovement::Accelerate: accel * dt * 250 * min( 1, maxspeed / 250 ) * friction ( * 0.34 в приседе )
+	float flAccelTick = g_Vars.sv_accelerate->GetFloat( ) * flDt * 250.f *
+		std::min( 1.f, pWeapon->GetMaxSpeed( ) / 250.f ) * pLocal->m_surfaceFriction( );
+	if( pLocal->m_flDuckAmount( ) > 0.55f )
+		flAccelTick *= 0.34f;
+
+	// тики до полной остановки: CGameMovement::Friction + встречный стрейф ( как InstantStop:
+	// ниже 15 ед/с он стрейф не жмёт, остаётся только трение ).
+	auto TicksToStop = [ & ] ( float s ) -> int {
+		const float flFriction = g_Vars.sv_friction->GetFloat( ) * pLocal->m_surfaceFriction( );
+		const float flStopSpeed = g_Vars.sv_stopspeed->GetFloat( );
+
+		for( int i = 0; i < 32; ++i ) {
+			if( s < 0.1f )
+				return i;
+
+			const bool bCounterStrafe = s > 15.f;
+			s = std::max( 0.f, s - std::max( s, flStopSpeed ) * flFriction * flDt );
+			if( bCounterStrafe )
+				s = fabsf( s - flAccelTick ); // перелёт через ноль = небольшой откат назад
 		}
-	}
+		return 32;
+	};
 
+	const int nChoked = g_pClientState->m_nChokedCommands( );
+
+	// длина цикла: лимит, но не дальше ближайшего флика LBY ( чтобы граница пакета совпала с ним )
 	const int nTicksTillFlick = TIME_TO_TICKS( g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer ) - ( pLocal->m_nTickBase( ) + 2 );
-	int nMaxChokeTicks = g_Vars.sv_maxusrcmdprocessticks->GetInt( ) - 2;
-	if( nMaxChokeTicks > nTicksTillFlick )
+	int nMaxChokeTicks = std::min( g_Vars.sv_maxusrcmdprocessticks->GetInt( ) - 2, 14 );
+	if( nTicksTillFlick > 0 && nMaxChokeTicks > nTicksTillFlick )
 		nMaxChokeTicks = nTicksTillFlick;
+	nMaxChokeTicks = std::max( 1, nMaxChokeTicks );
 
-	const bool bFlickThisTick = TICKS_TO_TIME( pLocal->m_nTickBase( ) ) > g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer || g_ServerAnimations.m_uServerAnimations.m_bRealignBreaker;
-	const int nTicksLeftToStop = nMaxChokeTicks - g_pClientState->m_nChokedCommands( );
+	// у флика пакеты по 1: и префлик, и флик должны быть ПЕРВЫМИ командами своих пакетов
+	const bool bNearFlick = g_ServerAnimations.m_uServerAnimations.m_bRealignBreaker ||
+		TICKS_TO_TIME( pLocal->m_nTickBase( ) ) + TICKS_TO_TIME( 2 ) > g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer;
 
-	g_FakeLag.m_iAwaitingChoke = nMaxChokeTicks;
+	g_FakeLag.m_iAwaitingChoke = bNearFlick ? 1 : nMaxChokeTicks;
 
-	if( !( bFlickThisTick || ( TICKS_TO_TIME( pLocal->m_nTickBase( ) ) + g_pGlobalVars->interval_per_tick ) > g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer ) ) {
-		if( g_pClientState->m_nChokedCommands( ) < nMaxChokeTicks || nTicksToStop ) {
-			*bSendPacket = false;
-		}
+	// первую команду пакета анимирует сервер - на ней скорость должна быть 0. после этой
+	// команды остаются ( nMax - nChoked ) команд пакета + первая следующего ( на ней тоже стоп ).
+	// разгоняемся, только если ПОСЛЕ разгона ещё успеваем встать ( с запасом в 1 тик ).
+	const int nStopTicksLeft = ( nMaxChokeTicks - nChoked ) + 1;
+	const bool bMustStop = nChoked == 0 || bNearFlick || TicksToStop( flSpeed + flAccelTick ) > nStopTicksLeft - 1;
 
-		if( !pLocal->m_vecVelocity( ).Length2D( ) && !*bSendPacket && g_pClientState->m_nChokedCommands( ) > nMaxChokeTicks ) {
-			*bSendPacket = true;
-		}
-	}
-
-	if( nTicksToStop > nTicksLeftToStop - 1 || !g_pClientState->m_nChokedCommands( ) ) {
+	if( bMustStop ) {
 		InstantStop( cmd );
-
 		g_Movement.m_bModifiedMovementBeforePrediction = true;
-		//g_AntiAim.m_bAllowFakeWalkFlick = true;
 	}
+
+	// отправка строго по длине цикла: чок больше не уходит за sv_maxusrcmdprocessticks
+	*bSendPacket = bNearFlick || nChoked >= nMaxChokeTicks;
 
 	g_Vars.globals.m_bFakeWalking = true;
 }

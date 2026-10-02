@@ -11,6 +11,11 @@ public:
 	bool m_bDidFakelagOnPeek;
 	int m_iLagLimit;
 	int m_iAwaitingChoke;
+
+	int  m_iCycleChoke = 1;       // длина текущего цикла, выбирается один раз на его старте
+	int  m_iLastCycleChoke = 1;
+	bool m_bWasPeeking = false;
+	bool m_bForceMaxNext = false; // после сброса на пике следующий цикл - максимальный
 };
 
 extern FakeLag g_FakeLag;

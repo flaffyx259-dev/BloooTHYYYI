@@ -72,14 +72,18 @@ void ServerAnimations::HandleAnimationEvents( C_CSPlayer *pLocal, CCSGOPlayerAni
 	if( !ANIMATION_LAYER_MOVEMENT_LAND_OR_CLIMB || !ANIMATION_LAYER_MOVEMENT_JUMP_OR_FALL )
 		return;
 
-	int fFlags = g_Prediction.get_initial_vars( )->flags;
+	const auto pInitial = g_Prediction.get_initial_vars( );
+	if( !pInitial )
+		return;
+
+	int fFlags = pInitial->flags;
 
 	Vector vecStart = pLocal->m_vecOrigin( );
 	Vector vecEnd = vecStart;
 	Vector vecVelocity = pLocal->m_vecVelocity( );
 
 	vecVelocity.z -= ( g_Vars.sv_gravity->GetFloat( ) * g_pGlobalVars->interval_per_tick );
-	vecEnd += ( vecVelocity );
+	vecEnd += vecVelocity * g_pGlobalVars->interval_per_tick;
 	vecEnd.z -= 2.f;
 
 	CTraceFilterWorldOnly filter;
@@ -220,13 +224,17 @@ void ServerAnimations::HandleServerAnimation( ) {
 	const bool bBackupClientSideAnimation = pLocal->m_bClientSideAnimation( );
 
 	pLocal->m_bClientSideAnimation( ) = true;
+
+	const float flFootBefore = pState->m_flFootYaw;
+
 	pLocal->UpdateClientSideAnimation( );
 	pLocal->m_bClientSideAnimation( ) = bBackupClientSideAnimation;
 
 	// store here as people might fuck with them in lua
 	std::memcpy( m_uServerAnimations.m_pPoseParameters.data( ), pLocal->m_flPoseParameter( ), sizeof( float ) * 20 );
 
-	if( pState->m_bLanding && ( g_Prediction.get_initial_vars( )->flags & FL_ONGROUND ) && ( pLocal->m_fFlags( ) & FL_ONGROUND ) ) {
+	const auto pInitialVars = g_Prediction.get_initial_vars( );
+	if( pState->m_bLanding && pInitialVars && ( pInitialVars->flags & FL_ONGROUND ) && ( pLocal->m_fFlags( ) & FL_ONGROUND ) ) {
 		float flPitch = -10.f;
 
 		// -10.f pitch
@@ -241,26 +249,75 @@ void ServerAnimations::HandleServerAnimation( ) {
 
 	static int nBrokenTicks = 0;
 
-	// rebuild server CCSGOPlayerAnimState::SetUpVelocity
-	// predict m_flLowerBodyYawTarget
 	const float flServerTime = TICKS_TO_TIME( pLocal->m_nTickBase( ) );
-	// точная копия CCSGOPlayerAnimState::SetUpVelocity ( 2018 ). ветки "приземлился ->
-	// timer = now" у Valve НЕТ, на приземлении работает обычная логика ниже.
+
+	// --- предсказанный LBY: инициализация / респавн ---
+	static float flPredSpawnTime = -1.f;
+	if( !m_bPredictedLBYValid || flPredSpawnTime != pLocal->m_flSpawnTime( ) ) {
+		m_flPredictedLBY = pLocal->m_flLowerBodyYawTarget( );
+		m_bPredictedLBYValid = true;
+		m_flLBYMismatchSince = -1.f;
+		flPredSpawnTime = pLocal->m_flSpawnTime( );
+	}
+
+	// флик/префлик локально не анимированы, сервер их анимирует. повторяем SetUpVelocity
+	// стоя: clamp ног в eye ± aim yaw, затем ApproachAngle к LBY 100°/с.
+	float flFootServer = pState->m_flFootYaw;
+	const bool bSkippedAnim = m_uRenderAnimations.m_bDoingRealFlick || m_uRenderAnimations.m_bDoingPreFlick;
+	if( bSkippedAnim && pState->m_bOnGround && pState->m_flVelocityLengthXY <= 0.1f ) {
+		const float flEye = m_pCmd->viewangles.y;
+		float flFoot = flFootBefore;
+
+		const float flDelta = Math::AngleDiff( flEye, flFoot );
+		if( flDelta > pState->m_flAimYawMax )
+			flFoot = flEye - fabsf( pState->m_flAimYawMax );
+		else if( flDelta < pState->m_flAimYawMin )
+			flFoot = flEye + fabsf( pState->m_flAimYawMin );
+
+		flFoot = Math::AngleNormalize( flFoot );
+		flFoot = Math::ApproachAngle( m_flPredictedLBY, flFoot, pState->m_flLastUpdateIncrement * 100.f );
+
+		flFootServer = flFoot;
+		pState->m_flFootYaw = flFoot; // следующий апдейт продолжает от серверных ног
+	}
+
+	// точная копия CCSGOPlayerAnimState::SetUpVelocity ( 2018 ), теперь единственный владелец таймера.
 	if( pState->m_bOnGround ) {
 		if( pState->m_flVelocityLengthXY > 0.1f ) {
 			m_uServerAnimations.m_flLowerBodyRealignTimer = flServerTime + 0.22f;
 			m_uRenderAnimations.m_flLowerBodyRealignTimer = g_pGlobalVars->realtime + 0.22f;
 			m_uServerAnimations.m_bFirstFlick = bWasMoving = true;
+			m_flPredictedLBY = Math::AngleNormalize( m_pCmd->viewangles.y ); // в движении LBY = eye на каждом апдейте
 		}
-		// у Valve строго '>' и обязательное |foot - eye| > 35. без флика таймер НЕ
-		// перезапускается: сервер флинкнет на первом апдейте, где разница станет > 35.
-		// eye берём из команды: флик мы локально не анимируем, а сервер видит именно его.
 		else if( flServerTime > m_uServerAnimations.m_flLowerBodyRealignTimer &&
-				 fabsf( Math::AngleDiff( pState->m_flFootYaw, m_pCmd->viewangles.y ) ) > 35.0f ) {
+				 fabsf( Math::AngleDiff( flFootServer, m_pCmd->viewangles.y ) ) > 35.0f ) {
 			m_uServerAnimations.m_flLowerBodyRealignTimer = flServerTime + 1.1f;
 			m_uRenderAnimations.m_flLowerBodyRealignTimer = g_pGlobalVars->realtime + 1.1f;
+			m_uServerAnimations.m_bFirstFlick = false; // флик подтверждён моделью
+			m_flPredictedLBY = Math::AngleNormalize( m_pCmd->viewangles.y );
 		}
 	}
+
+	// сверка с сервером: стоя сетевой LBY догоняет предсказанный за RTT. если расхождение
+	// держится дольше - модель ошиблась, верим серверу. в движении не сверяем ( там всегда лаг ).
+	if( pState->m_bOnGround && pState->m_flVelocityLengthXY <= 0.1f ) {
+		float flRTT = 0.2f;
+		if( const auto pNet = g_pEngine->GetNetChannelInfo( ); pNet )
+			flRTT = pNet->GetLatency( FLOW_OUTGOING ) + pNet->GetLatency( FLOW_INCOMING );
+
+		if( fabsf( Math::AngleDiff( pLocal->m_flLowerBodyYawTarget( ), m_flPredictedLBY ) ) > 2.f ) {
+			if( m_flLBYMismatchSince < 0.f )
+				m_flLBYMismatchSince = g_pGlobalVars->realtime;
+			else if( g_pGlobalVars->realtime - m_flLBYMismatchSince > flRTT + 0.15f ) {
+				m_flPredictedLBY = pLocal->m_flLowerBodyYawTarget( );
+				m_flLBYMismatchSince = -1.f;
+			}
+		}
+		else
+			m_flLBYMismatchSince = -1.f;
+	}
+	else
+		m_flLBYMismatchSince = -1.f;
 
 #ifdef _DEBUG
 	// LBY локального игрока сетевой. сервер флинкнул стоя -> смотрим, где наш таймер.

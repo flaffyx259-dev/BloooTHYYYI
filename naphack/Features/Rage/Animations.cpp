@@ -179,6 +179,9 @@ void LagRecord_t::ApplyRecord( C_CSPlayer *pEntity ) {
 	pSaneEntity->SetAbsAngles( m_sAnims[ ESides::SIDE_SERVER ].m_angAbsAngles );
 
 	std::memcpy( pSaneEntity->m_CachedBoneData( ).Base( ), m_bIsBackup ? m_pBackupMatrix : m_sAnims[ ESides::SIDE_SERVER ].m_pMatrix, pSaneEntity->m_CachedBoneData( ).Count( ) * sizeof( matrix3x4_t ) );
+
+	// иначе ClipRayToEntity пересоберёт кости из живой анимации и трейс пойдёт не по записи.
+	pSaneEntity->ForceBoneCache( );
 }
 
 bool LagRecord_t::IsRecordValid( ) {
@@ -644,8 +647,19 @@ void Animations::AnimationEntry_t::UpdateAnimations( LagRecord_t *pRecord ) {
 		m_pEntity->m_PlayerAnimState( )->m_flFootYaw = pRecord->m_sAnims[ ESides::SIDE_MIDDLE ].m_flFootYaw;*/
 
 	// подсказка ног от резолвера: хитбоксы корпуса ставит footyaw, а не eye
-	if( pRecord->m_bHasFootYaw )
-		m_pEntity->m_PlayerAnimState( )->m_flFootYaw = pRecord->m_flFootYawHint;
+	CCSGOPlayerAnimState *pAnimState = m_pEntity->m_PlayerAnimState( );
+	if( pRecord->m_bHasFootYaw ) {
+		pAnimState->m_flFootYaw = pRecord->m_flFootYawHint;
+	}
+	else if( pRecord->m_eResolverStage == EResolverStages::RES_STAND && !pRecord->m_bLBYFlicked ) {
+		// равновесие серверного SetUpVelocity стоя: LBY, если он в пределах 58 от eye,
+		// иначе граница eye ± 58 со стороны LBY.
+		const float flEye = pRecord->m_angEyeAngles.y;
+		const float flDelta = Math::AngleDiff( pRecord->m_flLowerBodyYawTarget, flEye );
+		pAnimState->m_flFootYaw = fabsf( flDelta ) <= 58.f
+			? Math::AngleNormalize( pRecord->m_flLowerBodyYawTarget )
+			: Math::AngleNormalize( flEye + ( flDelta > 0.f ? 58.f : -58.f ) );
+	}
 
 	// run a full animation update
 	UpdatePlayer( pRecord );

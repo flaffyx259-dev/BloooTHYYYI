@@ -459,7 +459,7 @@ namespace Menu {
 						GUI::Group::BeginGroup( XorStr( "fake-lag options" ), Vector2D( 50, /*51*/65 ) );
 						{
 							GUI::Controls::Checkbox( XorStr( "enabled##fakelag" ), &g_Vars.rage.fake_lag );
-							GUI::Controls::Dropdown( XorStr( "fake-lag type" ), { XorStr( "factor" ), XorStr( "dynamic" ), XorStr( "fluctuate" )/*, XorStr( "Adaptive" )*/ }, &g_Vars.rage.fake_lag_type );
+							GUI::Controls::Dropdown( XorStr( "fake-lag type" ), { XorStr( "factor" ), XorStr( "dynamic" ), XorStr( "fluctuate" ), XorStr( "Adaptive" ) }, &g_Vars.rage.fake_lag_type );
 							GUI::Controls::Slider( XorStr( "fake-lag amount" ), &g_Vars.rage.fake_lag_amount, 1, std::clamp( g_Vars.sv_maxusrcmdprocessticks->GetInt( ) - 1, 0, 62 ) );
 
 							if( g_Vars.rage.fake_lag_type != 3 || GUI::ctx->setup ) {

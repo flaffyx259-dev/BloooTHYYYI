@@ -407,6 +407,10 @@ void Resolver::OnSpawnBlood( C_TEEffectDispatch *pBlood ) {
 
 		float flAngle = Math::AngleNormalize( fmodf( _flAngle, 360.f ) );
 
+		// анимстейт между итерациями не восстанавливался: ноги тянулись за eye прошлого угла,
+		// и матрица угла N зависела от угла N-1. откатываем состояние перед каждой гипотезой.
+		std::memcpy( pState, &pStateBackup, sizeof( CCSGOPlayerAnimState ) );
+
 		// rotate the player
 		ForcePlayerAngle( flAngle );
 
@@ -568,6 +572,9 @@ void Resolver::OnBulletImpact( LagRecord_t *pRecord, ImpactInfo_t *info ) {
 		// let's not add duplicate angles
 		if( bAlreadyExists )
 			continue;
+
+		// ноги тянутся за eye прошлой итерации -> матрица угла N зависит от угла N-1.
+		std::memcpy( pState, &pStateBackup, sizeof( CCSGOPlayerAnimState ) );
 
 		// rotate the player
 		ForcePlayerAngle( flAngle );
@@ -1132,10 +1139,15 @@ void Resolver::OnPlayerStand( LagRecord_t *pRecord, LagRecord_t *pPrevious ) {
 		data.m_flNextBodyUpdate += 1.1f;
 	}
 
-	// 2) истечение таймера. у Valve строго '>', и таймер сам НЕ перезапускается:
-	// если время вышло, а разницы > 35° не было, таймер так и остаётся истёкшим.
-	if( data.IsValidFloat( data.m_flNextBodyUpdate ) && pRecord->m_flAnimationTime > data.m_flNextBodyUpdate )
+	// 2) истечение таймера. флик - на ПЕРВОЙ анимированной команде после истечения, т.е.
+	// только на этой записи ( сервер анимирует одну команду пакета, это и есть m_flAnimationTime ).
+	// значение LBY при флике в тот же угол не меняется, поэтому считаем, что таймер
+	// перезапустился здесь ( у брейкера |foot - eye| > 35 всегда ).
+	data.m_bBodyTimerExpired = false;
+	if( data.IsValidFloat( data.m_flNextBodyUpdate ) && pRecord->m_flAnimationTime > data.m_flNextBodyUpdate ) {
 		data.m_bBodyTimerExpired = true;
+		data.m_flNextBodyUpdate = pRecord->m_flAnimationTime + 1.1f;
+	}
 
 	// 3) выстрел по истёкшему таймеру. строк += 1.1f здесь больше НЕТ.
 	if( data.m_bBodyTimerExpired && !data.m_bBodyTimerFailed && !bAdjustBreak ) {
@@ -1638,9 +1650,12 @@ void Resolver::OnPlayerStandTrial( LagRecord_t *pRecord, LagRecord_t *pPrevious 
 		data.m_flNextBodyUpdate += 1.1f;
 	}
 
-	// 2) истечение таймера. у Valve строго '>', и таймер сам НЕ перезапускается.
-	if( data.IsValidFloat( data.m_flNextBodyUpdate ) && pRecord->m_flAnimationTime > data.m_flNextBodyUpdate )
+	// 2) истечение таймера. флик - только на этой записи, дальше таймер фазой перезапущен.
+	data.m_bBodyTimerExpired = false;
+	if( data.IsValidFloat( data.m_flNextBodyUpdate ) && pRecord->m_flAnimationTime > data.m_flNextBodyUpdate ) {
 		data.m_bBodyTimerExpired = true;
+		data.m_flNextBodyUpdate = pRecord->m_flAnimationTime + 1.1f;
+	}
 
 	// 3) выстрел по истёкшему таймеру. строк += 1.1f здесь больше НЕТ.
 	if( data.m_bBodyTimerExpired && !data.m_bBodyTimerFailed && !bAdjustBreak ) {

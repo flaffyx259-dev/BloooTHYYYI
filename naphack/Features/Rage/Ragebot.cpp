@@ -40,6 +40,14 @@
 
 Aimbot g_Ragebot;
 
+namespace {
+	bool InitialOnGround( C_CSPlayer *pLocal ) {
+		const auto pData = g_Prediction.get_initial_vars( );
+		return pData ? ( pData->flags & FL_ONGROUND ) != 0
+		             : ( pLocal->m_fFlags( ) & FL_ONGROUND ) != 0;
+	}
+}
+
 void Animations::AnimationEntry_t::SetupHitboxes( LagRecord_t *record, bool history ) {
 	const auto pLocal = C_CSPlayer::GetLocalPlayer( );
 	if( !pLocal )
@@ -745,13 +753,11 @@ void Aimbot::think( bool *bSendPacket, CUserCmd *pCmd ) {
 		}
 	}
 
-	// we have a normal weapon or a non cocking revolver
-	// choke if its the processing tick.
+	// РїРµСЂРІР°СЏ РєРѕРјР°РЅРґР° РїР°С‡РєРё: СЃС‚СЂРµР»СЏС‚СЊ РЅРµР»СЊР·СЏ ( РµС‘ Р°РЅРёРјРёСЂСѓРµС‚ СЃРµСЂРІРµСЂ ), РЅРѕ С†РµР»СЊ Рё Р°РІС‚РѕСЃС‚РѕРї
+	// СЃС‡РёС‚Р°РµРј РєР°Рє РѕР±С‹С‡РЅРѕ. find( ) СЃР°Рј РЅРµ РЅР°Р¶РјС‘С‚ IN_ATTACK РїСЂРё choked < 1.
 	if( bCanShoot && !g_pClientState->m_nChokedCommands( ) && pWeapon->m_iItemDefinitionIndex( ) != WEAPON_REVOLVER ) {
 		*bSendPacket = false;
 		pCmd->buttons &= ~IN_ATTACK;
-
-		return;
 	}
 
 	const bool bSkipForRevolver = m_AimbotInfo.m_pWeapon->m_iItemDefinitionIndex( ) == WEAPON_REVOLVER && TICKS_TO_TIME( m_AimbotInfo.m_pLocal->m_nTickBase( ) ) >= m_AimbotInfo.m_pLocal->m_flNextAttack( ) && m_AimbotInfo.m_pWeapon->m_iClip1( ) > 0;
@@ -767,13 +773,13 @@ void Aimbot::think( bool *bSendPacket, CUserCmd *pCmd ) {
 			return;
 	}
 
-	// выстрел чокается, пакет уходит следующей командой ( RAX HandleShotChoke ),
-	// поэтому прибытие = как будто выстрел уйдёт этим пакетом + 1 тик.
+	// РІС‹СЃС‚СЂРµР» С‡РѕРєР°РµС‚СЃСЏ, РїР°РєРµС‚ СѓС…РѕРґРёС‚ СЃР»РµРґСѓСЋС‰РµР№ РєРѕРјР°РЅРґРѕР№ ( RAX HandleShotChoke ),
+	// РїРѕСЌС‚РѕРјСѓ РїСЂРёР±С‹С‚РёРµ = РєР°Рє Р±СѓРґС‚Рѕ РІС‹СЃС‚СЂРµР» СѓР№РґС‘С‚ СЌС‚РёРј РїР°РєРµС‚РѕРј + 1 С‚РёРє.
 	if( g_Vars.globals.m_bShotWhileHiding )
 		g_Animations.UpdateArrivalTick( false );
 	else {
 		g_Animations.UpdateArrivalTick( true );
-		g_Animations.m_nArrivalTick += 1; // выстрел уходит следующей командой
+		g_Animations.m_nArrivalTick += 1; // РІС‹СЃС‚СЂРµР» СѓС…РѕРґРёС‚ СЃР»РµРґСѓСЋС‰РµР№ РєРѕРјР°РЅРґРѕР№
 	}
 
 	auto vecPlayers = FindTargets( );
@@ -790,13 +796,11 @@ void Aimbot::think( bool *bSendPacket, CUserCmd *pCmd ) {
 
 		// setup bones for all valid targets.
 		for( auto &[player, i] : vecPlayers ) {
-			if( !player )
-
-				if( !IsValidTarget( player ) ) {
-					g_Visuals.vecAimpoints[ i ].clear( );
-					g_Visuals.vecAimpointsSane[ i ].clear( );
-					continue;
-				}
+			if( !player || !IsValidTarget( player ) ) {
+				g_Visuals.vecAimpoints[ i ].clear( );
+				g_Visuals.vecAimpointsSane[ i ].clear( );
+				continue;
+			}
 
 			if( g_PlayerList.GetSettings( player->GetSteamID( ) ).m_bAddToWhitelist ) {
 				g_Visuals.vecAimpoints[ i ].clear( );
@@ -837,7 +841,7 @@ void Aimbot::think( bool *bSendPacket, CUserCmd *pCmd ) {
 }
 
 EAutoStopType Aimbot::ChooseStop( ) {
-	const bool bInAir = ( !( m_AimbotInfo.m_pLocal->m_fFlags( ) & FL_ONGROUND ) || !( g_Prediction.get_initial_vars( )->flags & FL_ONGROUND ) || ( m_AimbotInfo.m_pCmd->buttons & IN_JUMP ) );
+	const bool bInAir = ( !( m_AimbotInfo.m_pLocal->m_fFlags( ) & FL_ONGROUND ) || !InitialOnGround( m_AimbotInfo.m_pLocal ) || ( m_AimbotInfo.m_pCmd->buttons & IN_JUMP ) );
 	const bool bCanPlayerFire = TICKS_TO_TIME( m_AimbotInfo.m_pLocal->m_nTickBase( ) ) >= m_AimbotInfo.m_pLocal->m_flNextAttack( );
 
 	// we are pulling out our weapon, or are in air, don't autostop.
@@ -889,10 +893,10 @@ void Aimbot::find( ) {
 			LagRecord_t front = t->m_deqRecords.front( );
 			const bool bFrontUsable = front.m_pEntity != nullptr && !front.m_bInvalid && !front.m_bGunGameImmunity;
 
-			// настоящая запись всегда имеет приоритет над прогнозом: сервер отмотает
-			// lagcomp именно к ней. прогноз пробуем ТОЛЬКО если по front не вышло.
-			// m_bDelay означает "лаг слишком велик, чтобы предсказать по этой записи"
-			// ( HandleLagcomp ), поэтому при нём front даже не трогаем.
+			// РЅР°СЃС‚РѕСЏС‰Р°СЏ Р·Р°РїРёСЃСЊ РІСЃРµРіРґР° РёРјРµРµС‚ РїСЂРёРѕСЂРёС‚РµС‚ РЅР°Рґ РїСЂРѕРіРЅРѕР·РѕРј: СЃРµСЂРІРµСЂ РѕС‚РјРѕС‚Р°РµС‚
+			// lagcomp РёРјРµРЅРЅРѕ Рє РЅРµР№. РїСЂРѕРіРЅРѕР· РїСЂРѕР±СѓРµРј РўРћР›Р¬РљРћ РµСЃР»Рё РїРѕ front РЅРµ РІС‹С€Р»Рѕ.
+			// m_bDelay РѕР·РЅР°С‡Р°РµС‚ "Р»Р°Рі СЃР»РёС€РєРѕРј РІРµР»РёРє, С‡С‚РѕР±С‹ РїСЂРµРґСЃРєР°Р·Р°С‚СЊ РїРѕ СЌС‚РѕР№ Р·Р°РїРёСЃРё"
+			// ( HandleLagcomp ), РїРѕСЌС‚РѕРјСѓ РїСЂРё РЅС‘Рј front РґР°Р¶Рµ РЅРµ С‚СЂРѕРіР°РµРј.
 			bool bFound = false;
 
 			if( bFrontUsable && !t->m_bDelay ) {
@@ -915,14 +919,14 @@ void Aimbot::find( ) {
 				}
 			}
 
-			// цель ломает lagcomp, а настоящая запись не дала цели ( или лаг слишком велик,
-			// чтобы по ней стрелять ). ровно та ситуация, под которую экстраполяция и писалась:
-			// предсказываем, где цель будет к моменту обработки нашей команды.
-			// ExtrapolateRecords сама откажется работать по стоящей цели, при нулевом чоке и
-			// когда новый настоящий апдейт обгонит нашу команду. вернула nullptr - подавляем
-			// выстрел, как и раньше.
-			// исключение: сервер стоит на нашей новейшей записи - прогноз не нужен,
-			// если по front не вышло, ждём свежую запись, а не стреляем предсказание.
+			// С†РµР»СЊ Р»РѕРјР°РµС‚ lagcomp, Р° РЅР°СЃС‚РѕСЏС‰Р°СЏ Р·Р°РїРёСЃСЊ РЅРµ РґР°Р»Р° С†РµР»Рё ( РёР»Рё Р»Р°Рі СЃР»РёС€РєРѕРј РІРµР»РёРє,
+			// С‡С‚РѕР±С‹ РїРѕ РЅРµР№ СЃС‚СЂРµР»СЏС‚СЊ ). СЂРѕРІРЅРѕ С‚Р° СЃРёС‚СѓР°С†РёСЏ, РїРѕРґ РєРѕС‚РѕСЂСѓСЋ СЌРєСЃС‚СЂР°РїРѕР»СЏС†РёСЏ Рё РїРёСЃР°Р»Р°СЃСЊ:
+			// РїСЂРµРґСЃРєР°Р·С‹РІР°РµРј, РіРґРµ С†РµР»СЊ Р±СѓРґРµС‚ Рє РјРѕРјРµРЅС‚Сѓ РѕР±СЂР°Р±РѕС‚РєРё РЅР°С€РµР№ РєРѕРјР°РЅРґС‹.
+			// ExtrapolateRecords СЃР°РјР° РѕС‚РєР°Р¶РµС‚СЃСЏ СЂР°Р±РѕС‚Р°С‚СЊ РїРѕ СЃС‚РѕСЏС‰РµР№ С†РµР»Рё, РїСЂРё РЅСѓР»РµРІРѕРј С‡РѕРєРµ Рё
+			// РєРѕРіРґР° РЅРѕРІС‹Р№ РЅР°СЃС‚РѕСЏС‰РёР№ Р°РїРґРµР№С‚ РѕР±РіРѕРЅРёС‚ РЅР°С€Сѓ РєРѕРјР°РЅРґСѓ. РІРµСЂРЅСѓР»Р° nullptr - РїРѕРґР°РІР»СЏРµРј
+			// РІС‹СЃС‚СЂРµР», РєР°Рє Рё СЂР°РЅСЊС€Рµ.
+			// РёСЃРєР»СЋС‡РµРЅРёРµ: СЃРµСЂРІРµСЂ СЃС‚РѕРёС‚ РЅР° РЅР°С€РµР№ РЅРѕРІРµР№С€РµР№ Р·Р°РїРёСЃРё - РїСЂРѕРіРЅРѕР· РЅРµ РЅСѓР¶РµРЅ,
+			// РµСЃР»Рё РїРѕ front РЅРµ РІС‹С€Р»Рѕ, Р¶РґС‘Рј СЃРІРµР¶СѓСЋ Р·Р°РїРёСЃСЊ, Р° РЅРµ СЃС‚СЂРµР»СЏРµРј РїСЂРµРґСЃРєР°Р·Р°РЅРёРµ.
 			if( !bFound && !t->IsNewestServerHead( ) ) {
 				LagRecord_t *pPredicted = t->ExtrapolateRecords( );
 				if( !pPredicted )
@@ -1006,14 +1010,14 @@ void Aimbot::find( ) {
 				break;
 			}
 
-			// экстраполяции здесь нет намеренно. сюда мы попадаем, когда цель НЕ ломает
-			// lagcomp, т.е. сервер гарантированно отмотает её к настоящей записи истории -
-			// любой прогноз в этом случае строго хуже. фоллбэк на ExtrapolateRecords( )
-			// живёт в if-ветке выше, где настоящих пригодных записей нет по построению.
+			// СЌРєСЃС‚СЂР°РїРѕР»СЏС†РёРё Р·РґРµСЃСЊ РЅРµС‚ РЅР°РјРµСЂРµРЅРЅРѕ. СЃСЋРґР° РјС‹ РїРѕРїР°РґР°РµРј, РєРѕРіРґР° С†РµР»СЊ РќР• Р»РѕРјР°РµС‚
+			// lagcomp, С‚.Рµ. СЃРµСЂРІРµСЂ РіР°СЂР°РЅС‚РёСЂРѕРІР°РЅРЅРѕ РѕС‚РјРѕС‚Р°РµС‚ РµС‘ Рє РЅР°СЃС‚РѕСЏС‰РµР№ Р·Р°РїРёСЃРё РёСЃС‚РѕСЂРёРё -
+			// Р»СЋР±РѕР№ РїСЂРѕРіРЅРѕР· РІ СЌС‚РѕРј СЃР»СѓС‡Р°Рµ СЃС‚СЂРѕРіРѕ С…СѓР¶Рµ. С„РѕР»Р»Р±СЌРє РЅР° ExtrapolateRecords( )
+			// Р¶РёРІС‘С‚ РІ if-РІРµС‚РєРµ РІС‹С€Рµ, РіРґРµ РЅР°СЃС‚РѕСЏС‰РёС… РїСЂРёРіРѕРґРЅС‹С… Р·Р°РїРёСЃРµР№ РЅРµС‚ РїРѕ РїРѕСЃС‚СЂРѕРµРЅРёСЋ.
 		}
 	}
 
-	const bool bInAir = ( !( m_AimbotInfo.m_pLocal->m_fFlags( ) & FL_ONGROUND ) || !( g_Prediction.get_initial_vars( )->flags & FL_ONGROUND ) || ( m_AimbotInfo.m_pCmd->buttons & IN_JUMP ) );
+	const bool bInAir = ( !( m_AimbotInfo.m_pLocal->m_fFlags( ) & FL_ONGROUND ) || !InitialOnGround( m_AimbotInfo.m_pLocal ) || ( m_AimbotInfo.m_pCmd->buttons & IN_JUMP ) );
 
 	const bool bCanPlayerFire = TICKS_TO_TIME( m_AimbotInfo.m_pLocal->m_nTickBase( ) ) >= m_AimbotInfo.m_pLocal->m_flNextAttack( );
 	const bool bCanShoot = m_AimbotInfo.m_pLocal->CanShoot( );
@@ -1071,14 +1075,14 @@ void Aimbot::find( ) {
 
 		// attack.
 		if( ( bHit || !bHitchanceOn ) && g_Vars.rage.auto_fire ) {
-			// выстрел только НЕ первой командой пачки: первую анимирует сервер
+			// РІС‹СЃС‚СЂРµР» С‚РѕР»СЊРєРѕ РќР• РїРµСЂРІРѕР№ РєРѕРјР°РЅРґРѕР№ РїР°С‡РєРё: РїРµСЂРІСѓСЋ Р°РЅРёРјРёСЂСѓРµС‚ СЃРµСЂРІРµСЂ
 			if( g_pClientState->m_nChokedCommands( ) < 1 )
-				return; // подождём следующую команду
+				return; // РїРѕРґРѕР¶РґС‘Рј СЃР»РµРґСѓСЋС‰СѓСЋ РєРѕРјР°РЅРґСѓ
 
 			m_AimbotInfo.m_pCmd->buttons |= IN_ATTACK;
 
-			// сам выстрел чокаем ( угол не уйдёт ни в анимацию, ни в сетевые eye angles ),
-			// отправляем следующей командой ( RAX HandleShotChoke ).
+			// СЃР°Рј РІС‹СЃС‚СЂРµР» С‡РѕРєР°РµРј ( СѓРіРѕР» РЅРµ СѓР№РґС‘С‚ РЅРё РІ Р°РЅРёРјР°С†РёСЋ, РЅРё РІ СЃРµС‚РµРІС‹Рµ eye angles ),
+			// РѕС‚РїСЂР°РІР»СЏРµРј СЃР»РµРґСѓСЋС‰РµР№ РєРѕРјР°РЅРґРѕР№ ( RAX HandleShotChoke ).
 			if( g_pClientState->m_nChokedCommands( ) < g_Vars.sv_maxusrcmdprocessticks->GetInt( ) - 2 ) {
 				*m_AimbotInfo.m_pSendPacket = false;
 				m_bSendNextCommand = true;
@@ -1166,10 +1170,6 @@ bool Aimbot::CheckHitchance( C_CSPlayer *player, const QAngle &angle ) {
 
 	auto *hitbox = m_bbox;
 
-	if( ( g_Prediction.ideal_inaccuracy + 0.0005f ) >= networked_vars->inaccuracy ) {
-		return true;
-	}
-
 	matrix3x4_t bone_transform;
 	memcpy( &bone_transform, &m_record.m_sAnims[ ESides::SIDE_SERVER ].m_pMatrix[ hitbox->bone ], sizeof( matrix3x4_t ) );
 	if( !hitbox->m_angAngles.IsZero( ) ) {
@@ -1182,6 +1182,21 @@ bool Aimbot::CheckHitchance( C_CSPlayer *player, const QAngle &angle ) {
 	Vector vMin, vMax;
 	Math::VectorTransform( hitbox->bbmin, bone_transform, vMin );
 	Math::VectorTransform( hitbox->bbmax, bone_transform, vMax );
+
+	// РїСЂРѕРїСѓСЃРєР°РµРј РїРµСЂРµР±РѕСЂ, С‚РѕР»СЊРєРѕ РµСЃР»Рё Р’Р•РЎР¬ РєРѕРЅСѓСЃ ( inaccuracy + spread ) Р»РµР¶РёС‚ РІРЅСѓС‚СЂРё РєР°РїСЃСѓР»С‹.
+	if( hitbox->m_flRadius > 0.f ) {
+		const auto DistToSegment = [ ] ( const Vector &p, const Vector &a, const Vector &b ) {
+			const Vector ab = b - a;
+			const float flLenSqr = ab.LengthSquared( );
+			const float t = flLenSqr > 0.f ? std::clamp( ( p - a ).Dot( ab ) / flLenSqr, 0.f, 1.f ) : 0.f;
+			return ( a + ab * t - p ).Length( );
+		};
+
+		const float flCone = ( inaccuracy + spread ) * start.Distance( m_aim );
+		const float flMargin = hitbox->m_flRadius - DistToSegment( m_aim, vMin, vMax );
+		if( flCone <= flMargin )
+			return true;
+	}
 
 	Vector forward{}, right{}, up{};
 
@@ -1366,10 +1381,10 @@ bool Animations::AnimationEntry_t::SetupHitboxPoints( LagRecord_t *record, matri
 	if( !( record->m_fPredFlags & FL_ONGROUND ) )
 		pointScale *= 0.5f;
 
-	// по прогнозу стреляем только в центр хитбокса. порядок строк НАМЕРЕННЫЙ: проверка
-	// динамического масштаба ( pointScale == 0.f выше ) стоит раньше, поэтому обнуление
-	// здесь не включает bDoDynamicScale, а именно отключает multipoint. у прогноза нет
-	// реального снапшота, к которому сервер отмотает, - края хитбокса там недостоверны.
+	// РїРѕ РїСЂРѕРіРЅРѕР·Сѓ СЃС‚СЂРµР»СЏРµРј С‚РѕР»СЊРєРѕ РІ С†РµРЅС‚СЂ С…РёС‚Р±РѕРєСЃР°. РїРѕСЂСЏРґРѕРє СЃС‚СЂРѕРє РќРђРњР•Р Р•РќРќР«Р™: РїСЂРѕРІРµСЂРєР°
+	// РґРёРЅР°РјРёС‡РµСЃРєРѕРіРѕ РјР°СЃС€С‚Р°Р±Р° ( pointScale == 0.f РІС‹С€Рµ ) СЃС‚РѕРёС‚ СЂР°РЅСЊС€Рµ, РїРѕСЌС‚РѕРјСѓ РѕР±РЅСѓР»РµРЅРёРµ
+	// Р·РґРµСЃСЊ РЅРµ РІРєР»СЋС‡Р°РµС‚ bDoDynamicScale, Р° РёРјРµРЅРЅРѕ РѕС‚РєР»СЋС‡Р°РµС‚ multipoint. Сѓ РїСЂРѕРіРЅРѕР·Р° РЅРµС‚
+	// СЂРµР°Р»СЊРЅРѕРіРѕ СЃРЅР°РїС€РѕС‚Р°, Рє РєРѕС‚РѕСЂРѕРјСѓ СЃРµСЂРІРµСЂ РѕС‚РјРѕС‚Р°РµС‚, - РєСЂР°СЏ С…РёС‚Р±РѕРєСЃР° С‚Р°Рј РЅРµРґРѕСЃС‚РѕРІРµСЂРЅС‹.
 	if( record->m_bExtrapolated )
 		pointScale = 0.f;
 
@@ -1588,8 +1603,8 @@ bool Animations::AnimationEntry_t::SetupHitboxPoints( LagRecord_t *record, matri
 	return true;
 }
 
-// доля гипотез ног ( сервер + 3 стороны ), в которых луч на точку задевает ТОТ ЖЕ хитбокс.
-// 1.0 = попадём при любом footyaw в пределах eye ± 58 ( RAX CheckIntersection ).
+// РґРѕР»СЏ РіРёРїРѕС‚РµР· РЅРѕРі ( СЃРµСЂРІРµСЂ + 3 СЃС‚РѕСЂРѕРЅС‹ ), РІ РєРѕС‚РѕСЂС‹С… Р»СѓС‡ РЅР° С‚РѕС‡РєСѓ Р·Р°РґРµРІР°РµС‚ РўРћРў Р–Р• С…РёС‚Р±РѕРєСЃ.
+// 1.0 = РїРѕРїР°РґС‘Рј РїСЂРё Р»СЋР±РѕРј footyaw РІ РїСЂРµРґРµР»Р°С… eye В± 58 ( RAX CheckIntersection ).
 float Aimbot::GetPointSafety( LagRecord_t *pRecord, const Vector &vecStart, const Vector &vecPoint, int nHitbox ) {
 	C_CSPlayer *pEntity = pRecord->m_pEntity;
 	if( !pEntity )
@@ -1610,7 +1625,7 @@ float Aimbot::GetPointSafety( LagRecord_t *pRecord, const Vector &vecStart, cons
 
 	int nHits = 0, nTotal = 0;
 	for( const ESides eSide : arrSides ) {
-		// сторона не считалась ( запись без предыдущей ) - не учитываем ни за, ни против
+		// СЃС‚РѕСЂРѕРЅР° РЅРµ СЃС‡РёС‚Р°Р»Р°СЃСЊ ( Р·Р°РїРёСЃСЊ Р±РµР· РїСЂРµРґС‹РґСѓС‰РµР№ ) - РЅРµ СѓС‡РёС‚С‹РІР°РµРј РЅРё Р·Р°, РЅРё РїСЂРѕС‚РёРІ
 		if( eSide != ESides::SIDE_SERVER && !pRecord->m_sAnims[ eSide ].m_bUpdated )
 			continue;
 
@@ -1694,10 +1709,10 @@ bool Animations::AnimationEntry_t::GetBestAimPosition( Vector &aim, float &damag
 				if( it.m_index == HITBOX_HEAD && out.m_hitgroup != Hitgroup_Head )
 					continue;
 
-				// доля гипотез ног, в которых луч на точку задевает ТОТ ЖЕ хитбокс
+				// РґРѕР»СЏ РіРёРїРѕС‚РµР· РЅРѕРі, РІ РєРѕС‚РѕСЂС‹С… Р»СѓС‡ РЅР° С‚РѕС‡РєСѓ Р·Р°РґРµРІР°РµС‚ РўРћРў Р–Р• С…РёС‚Р±РѕРєСЃ
 				const float flSafety = g_Ragebot.GetPointSafety( record, g_Ragebot.m_AimbotInfo.m_vecEyePosition, point.second.first, it.m_index );
 
-				// низкая уверенность резолвера: только точки, которые попадают при ЛЮБЫХ ногах
+				// РЅРёР·РєР°СЏ СѓРІРµСЂРµРЅРЅРѕСЃС‚СЊ СЂРµР·РѕР»РІРµСЂР°: С‚РѕР»СЊРєРѕ С‚РѕС‡РєРё, РєРѕС‚РѕСЂС‹Рµ РїРѕРїР°РґР°СЋС‚ РїСЂРё Р›Р®Р‘Р«РҐ РЅРѕРіР°С…
 				if( record->m_eConfidence == EConfidence::CONF_LOW && flSafety < 1.f )
 					continue;
 
@@ -1718,7 +1733,7 @@ bool Animations::AnimationEntry_t::GetBestAimPosition( Vector &aim, float &damag
 				else if( it.m_mode == HitscanMode::NORMAL ) {
 					// we did more damage.
 					if( out.m_damage > scan.m_damage
-						// при равном уроне выбирай точку корпуса с flSafety == 1.f
+						// РїСЂРё СЂР°РІРЅРѕРј СѓСЂРѕРЅРµ РІС‹Р±РёСЂР°Р№ С‚РѕС‡РєСѓ РєРѕСЂРїСѓСЃР° СЃ flSafety == 1.f
 						|| ( out.m_damage == scan.m_damage && flSafety >= 1.f && it.m_index != HITBOX_HEAD && flBestSafety < 1.f ) ) {
 						// save new best data.
 						scan.m_damage = out.m_damage;
@@ -1833,9 +1848,9 @@ void Aimbot::apply( ) {
 		//	m_record.m_bAttemptedShot = true;
 
 		if( !g_Vars.globals.m_bFakeWalking ) {
-			// RAX HandleShotChoke: выстрел — средняя команда пачки, не первая и не последняя.
-			// сам выстрел чокаем ( угол не уйдёт ни в анимацию, ни в сетевые eye angles ),
-			// пакет уйдёт следующей командой через m_bSendNextCommand ( выставляется ниже ).
+			// RAX HandleShotChoke: РІС‹СЃС‚СЂРµР» вЂ” СЃСЂРµРґРЅСЏСЏ РєРѕРјР°РЅРґР° РїР°С‡РєРё, РЅРµ РїРµСЂРІР°СЏ Рё РЅРµ РїРѕСЃР»РµРґРЅСЏСЏ.
+			// СЃР°Рј РІС‹СЃС‚СЂРµР» С‡РѕРєР°РµРј ( СѓРіРѕР» РЅРµ СѓР№РґС‘С‚ РЅРё РІ Р°РЅРёРјР°С†РёСЋ, РЅРё РІ СЃРµС‚РµРІС‹Рµ eye angles ),
+			// РїР°РєРµС‚ СѓР№РґС‘С‚ СЃР»РµРґСѓСЋС‰РµР№ РєРѕРјР°РЅРґРѕР№ С‡РµСЂРµР· m_bSendNextCommand ( РІС‹СЃС‚Р°РІР»СЏРµС‚СЃСЏ РЅРёР¶Рµ ).
 			if( !g_Vars.globals.m_bShotWhileHiding &&
 				g_pClientState->m_nChokedCommands( ) < g_Vars.sv_maxusrcmdprocessticks->GetInt( ) - 2 )
 				*m_AimbotInfo.m_pSendPacket = false;
@@ -1847,7 +1862,7 @@ void Aimbot::apply( ) {
 			// make sure to aim at un-interpolated data.
 			// do this so BacktrackEntity selects the exact record.
 			if( m_record.m_pEntity != nullptr && !m_record.m_bBrokeTeleportDst ) {
-				// округляем лерп ВВЕРХ: цель сервера никогда не уходит ниже simtime записи
+				// РѕРєСЂСѓРіР»СЏРµРј Р»РµСЂРї Р’Р’Р•Р РҐ: С†РµР»СЊ СЃРµСЂРІРµСЂР° РЅРёРєРѕРіРґР° РЅРµ СѓС…РѕРґРёС‚ РЅРёР¶Рµ simtime Р·Р°РїРёСЃРё
 				const int nLerpTicks = static_cast< int >( std::ceil( g_Animations.m_fLerpTime / g_pGlobalVars->interval_per_tick - 0.001f ) );
 				m_AimbotInfo.m_pCmd->tick_count = TIME_TO_TICKS( m_record.m_flSimulationTime ) + nLerpTicks;
 			}
@@ -2002,9 +2017,9 @@ bool Aimbot::HandleLagcomp( Animations::AnimationEntry_t *data ) {
 	if( !g_Animations.BreakingTeleportDistance( data->m_pEntity->EntIndex( ) ) )
 		return false;
 
-	// сервер стоит на нашей новейшей записи к моменту обработки команды:
-	// стреляем по m_deqRecords[ 0 ] без задержки и без экстраполяции.
-	// m_bDelay уже сброшен выше, front валиден по построению IsNewestServerHead.
+	// СЃРµСЂРІРµСЂ СЃС‚РѕРёС‚ РЅР° РЅР°С€РµР№ РЅРѕРІРµР№С€РµР№ Р·Р°РїРёСЃРё Рє РјРѕРјРµРЅС‚Сѓ РѕР±СЂР°Р±РѕС‚РєРё РєРѕРјР°РЅРґС‹:
+	// СЃС‚СЂРµР»СЏРµРј РїРѕ m_deqRecords[ 0 ] Р±РµР· Р·Р°РґРµСЂР¶РєРё Рё Р±РµР· СЌРєСЃС‚СЂР°РїРѕР»СЏС†РёРё.
+	// m_bDelay СѓР¶Рµ СЃР±СЂРѕС€РµРЅ РІС‹С€Рµ, front РІР°Р»РёРґРµРЅ РїРѕ РїРѕСЃС‚СЂРѕРµРЅРёСЋ IsNewestServerHead.
 	if( data->IsNewestServerHead( ) )
 		return true;
 
