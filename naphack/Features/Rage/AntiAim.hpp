@@ -48,6 +48,8 @@ private:
 	void PerformBodyFlick( CUserCmd *pCmd, bool *bSendPacket, float flOffset = 0.f );
 	void HandleManual( CUserCmd *pCmd, C_CSPlayer *pLocal );
 	void DesyncLastMove( CUserCmd *pCmd, bool *bSendPacket );
+	float KeepAwayFromBody( float flYaw, float flBody, float flMinDelta );
+	float GetFlickYaw( C_CSPlayer *pLocal );
 private:
 	float m_flLastRealAngle;
 

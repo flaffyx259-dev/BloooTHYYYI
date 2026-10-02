@@ -668,7 +668,7 @@ public:
 	//config_option( int, anti_aim_yaw_jumping, 0 );
 	//config_option( int, anti_aim_yaw_jumping_jitter, 0 );
 
-	config_option( int, anti_aim_fake_yaw, 0 );
+	config_option( int, anti_aim_fake_yaw, 6 );
 	config_option( int, anti_aim_fake_yaw_relative, 0 );
 	config_option( int, anti_aim_fake_yaw_jitter, 0 );
 

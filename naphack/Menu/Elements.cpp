@@ -489,7 +489,7 @@ namespace Menu {
 									GUI::Controls::Slider( XorStr( "base yaw jitter distance" ), &g_Vars.rage.anti_aim_yaw_jitter, 0, 180, XorStr( "%d" ), 1 );
 								}
 
-							GUI::Controls::Dropdown( XorStr( "fake yaw" ), { XorStr( "none" ), XorStr( "default" ), XorStr( "opposite" ), XorStr( "jitter" ), XorStr( "spin" ), XorStr( "random" ) }, &g_Vars.rage.anti_aim_fake_yaw );
+							GUI::Controls::Dropdown( XorStr( "fake yaw" ), { XorStr( "none" ), XorStr( "default" ), XorStr( "opposite" ), XorStr( "jitter" ), XorStr( "spin" ), XorStr( "random" ), XorStr( "lby (no leak)" ) }, &g_Vars.rage.anti_aim_fake_yaw );
 							if( g_Vars.rage.anti_aim_fake_yaw == 2 || GUI::ctx->setup ) {
 								GUI::Controls::Slider( XorStr( "fake yaw additive" ), &g_Vars.rage.anti_aim_fake_yaw_relative, -180, 180, XorStr( "%d" ), 1 );
 							}

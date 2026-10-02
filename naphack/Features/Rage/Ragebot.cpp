@@ -767,11 +767,14 @@ void Aimbot::think( bool *bSendPacket, CUserCmd *pCmd ) {
 			return;
 	}
 
-	// прибытие считаем так, будто выстрел уйдёт этим пакетом ( как RAX: server_tick + RTT + 1 )
+	// выстрел чокается, пакет уходит следующей командой ( RAX HandleShotChoke ),
+	// поэтому прибытие = как будто выстрел уйдёт этим пакетом + 1 тик.
 	if( g_Vars.globals.m_bShotWhileHiding )
 		g_Animations.UpdateArrivalTick( false );
-	else
+	else {
 		g_Animations.UpdateArrivalTick( true );
+		g_Animations.m_nArrivalTick += 1; // выстрел уходит следующей командой
+	}
 
 	auto vecPlayers = FindTargets( );
 	if( !vecPlayers.empty( ) ) {
@@ -1068,12 +1071,18 @@ void Aimbot::find( ) {
 
 		// attack.
 		if( ( bHit || !bHitchanceOn ) && g_Vars.rage.auto_fire ) {
+			// выстрел только НЕ первой командой пачки: первую анимирует сервер
+			if( g_pClientState->m_nChokedCommands( ) < 1 )
+				return; // подождём следующую команду
+
 			m_AimbotInfo.m_pCmd->buttons |= IN_ATTACK;
 
-			// выстрел уходит сразу, и только если он НЕ первая команда пачки:
-			// сервер 2018 анимирует на первой, так угол выстрела не попадёт в анимацию
-			if( g_pClientState->m_nChokedCommands( ) >= 1 && !g_Vars.globals.m_bShotWhileHiding )
-				*m_AimbotInfo.m_pSendPacket = true;
+			// сам выстрел чокаем ( угол не уйдёт ни в анимацию, ни в сетевые eye angles ),
+			// отправляем следующей командой ( RAX HandleShotChoke ).
+			if( g_pClientState->m_nChokedCommands( ) < g_Vars.sv_maxusrcmdprocessticks->GetInt( ) - 2 ) {
+				*m_AimbotInfo.m_pSendPacket = false;
+				m_bSendNextCommand = true;
+			}
 
 			if( g_TickbaseController.m_bTapShot ) {
 				g_TickbaseController.m_bTapShot = false;
@@ -1824,11 +1833,13 @@ void Aimbot::apply( ) {
 		//	m_record.m_bAttemptedShot = true;
 
 		if( !g_Vars.globals.m_bFakeWalking ) {
-			// выстрел уходит сразу, если он НЕ первая команда пачки ( как в find ).
-			// чоким только первую команду / hide shots, иначе тик прибытия разъедется.
-			if( g_pClientState->m_nChokedCommands( ) >= 1 && !g_Vars.globals.m_bShotWhileHiding )
-				*m_AimbotInfo.m_pSendPacket = true;
-			else
+			// RAX HandleShotChoke: выстрел — средняя команда пачки, не первая и не последняя.
+			// сам выстрел чокаем ( угол не уйдёт ни в анимацию, ни в сетевые eye angles ),
+			// пакет уйдёт следующей командой через m_bSendNextCommand ( выставляется ниже ).
+			if( !g_Vars.globals.m_bShotWhileHiding &&
+				g_pClientState->m_nChokedCommands( ) < g_Vars.sv_maxusrcmdprocessticks->GetInt( ) - 2 )
+				*m_AimbotInfo.m_pSendPacket = false;
+			else if( !g_Vars.globals.m_bShotWhileHiding )
 				*m_AimbotInfo.m_pSendPacket = g_Vars.rage.exploit && g_Vars.rage.double_tap_bind.enabled;
 		}
 

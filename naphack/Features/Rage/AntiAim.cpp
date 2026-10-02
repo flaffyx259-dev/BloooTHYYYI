@@ -446,6 +446,13 @@ void AntiAim::DoFakeYaw( CUserCmd *pCmd, C_CSPlayer *pLocal ) {
 		case 5:
 			pCmd->viewangles.y = RandomFloat( -180.f, 180.f );
 			break;
+		case 6: {
+			// RAX: в сетевые eye angles уходит LBY. противник его и так видит -> ноль новой
+			// информации. в движении LBY = eye первой команды пачки ( сервер ставит его сам ),
+			// так что и там мы не выдаём ничего сверх того, что уже выдал сервер.
+			pCmd->viewangles.y = pLocal->m_flLowerBodyYawTarget( );
+			break;
+		}
 	}
 }
 
@@ -781,6 +788,31 @@ bool AntiAim::HandleUseAction( CUserCmd *pCmd, C_CSPlayer *pLocal ) {
 	return true;
 }
 
+// реал не подпускаем к LBY ближе flMinDelta. 100 = 58 ( ширина aim matrix ) + 35 ( порог флика )
+// + запас: ноги ( они в пределах eye ± 58 ) всегда остаются > 35 от LBY, поэтому флик в тот же
+// LBY проходит без префлика, а голова никогда не стоит там, куда стреляет LBY-резолвер.
+float AntiAim::KeepAwayFromBody( float flYaw, float flBody, float flMinDelta ) {
+	const float flDelta = Math::AngleDiff( flYaw, flBody );
+	if( fabsf( flDelta ) >= flMinDelta )
+		return flYaw;
+
+	return Math::AngleNormalize( flBody + ( flDelta >= 0.f ? flMinDelta : -flMinDelta ) );
+}
+
+// куда флинкать. первый флик после остановки ( RAX hide_yaw ): уводим LBY на 120 в сторону
+// реала, чтобы он ушёл от последнего угла движения. дальше - флик в ТОТ ЖЕ LBY: значение
+// не меняется, у резолверов нет события "LBY update" и нет body delta для обучения.
+float AntiAim::GetFlickYaw( C_CSPlayer *pLocal ) {
+	const float flBody = pLocal->m_flLowerBodyYawTarget( );
+
+	if( g_ServerAnimations.m_uServerAnimations.m_bFirstFlick ) {
+		const float flToReal = Math::AngleDiff( m_flLastRealAngle, flBody );
+		return Math::AngleNormalize( flBody + ( flToReal >= 0.f ? 120.f : -120.f ) );
+	}
+
+	return flBody;
+}
+
 void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 	bool attack, attack2;
 
@@ -926,7 +958,9 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 	bool bMoving = false;
 
 	const bool bFlickThisTick = TICKS_TO_TIME( pLocal->m_nTickBase( ) ) > g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer || g_ServerAnimations.m_uServerAnimations.m_bRealignBreaker;
-	const bool bTickBeforeFlick = ( TICKS_TO_TIME( pLocal->m_nTickBase( ) ) + g_pGlobalVars->interval_per_tick ) > g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer;
+	// стоя пачки по 2 команды ( см. ниже ) -> анимация каждые 2 тика, префлик = прошлая анимация
+	const bool bTickBeforeFlick = !bFlickThisTick &&
+		( TICKS_TO_TIME( pLocal->m_nTickBase( ) ) + TICKS_TO_TIME( 2 ) ) > g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer;
 
 	static QAngle angLastAngle = pCmd->viewangles;
 	if( !*bSendPacket || !*bFinalPacket || g_AntiAim.m_bHasOverriden ) {
@@ -993,8 +1027,10 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 
 		bool bEnsureBreaking = true;
 		if( pLocal->m_vecVelocity( ).Length2D( ) <= 0.1f || g_Vars.globals.m_bFakeWalking ) {
-			// make sure we aren't fail breaking, and our lby is where we want it to be
-			bEnsureBreaking = pLocal->m_flLowerBodyYawTarget( ) == flWantedBody;
+			// сетевой LBY квантуется, точное == ненадёжно. смысл теперь другой —
+			// «ломаем ли мы LBY вообще»: флик идёт в тот же LBY, так что проверяем
+			// дельту реала от LBY, а не совпадение LBY с желаемым углом.
+			bEnsureBreaking = fabsf( Math::AngleDiff( pLocal->m_flLowerBodyYawTarget( ), m_flLastRealAngle ) ) >= 35.f;
 		}
 
 		if( bEnsureBreaking ) {
@@ -1055,6 +1091,12 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 				pCmd->viewangles.y += std::fmodf( g_pGlobalVars->curtime * ( m_flRandDistortFactor * m_flRandDistortSpeed ), 360.f );
 			}
 		}
+
+		// работает и поверх distortion: голова крутится, но вне сектора LBY ± 100.
+		// до первого флика после остановки не трогаем: LBY там ещё = последний угол движения.
+		if( ( pLocal->m_fFlags( ) & FL_ONGROUND ) && pLocal->m_PlayerAnimState( )->m_flVelocityLengthXY <= 0.1f &&
+			!g_ServerAnimations.m_uServerAnimations.m_bFirstFlick && !m_bClimbingLadder && !g_Vars.globals.m_bFakeWalking )
+			pCmd->viewangles.y = KeepAwayFromBody( pCmd->viewangles.y, pLocal->m_flLowerBodyYawTarget( ), 100.f );
 
 		DesyncLastMove( pCmd, nullptr );
 
@@ -1166,49 +1208,63 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 
 	// fake body.
 	if( bIIsAbleToFlick ) {
+		static bool bWasHidingFlick = false;
+		// случайная задержка обновления LBY ( исправление 5 ). переживает тики,
+		// поэтому static. шаг 2: анимация стоя идёт каждые 2 тика ( пачки по 2 ).
+		static int nDelayTicks = 0;
+
+		bool bDelayedFlick = false;
 		if( bFlickThisTick ) {
-			m_bLbyUpdateThisTick = true;
+			// сервер обновит LBY только при |foot - eye| > 35 ( SetUpVelocity ). держим eye в 25° от ног
+			// случайные 0..6 тиков после истечения таймера: прогноз флика у резолверов промахивается,
+			// а наш таймер остаётся истёкшим, как и у сервера.
+			const int nSinceExpire = TIME_TO_TICKS( TICKS_TO_TIME( pLocal->m_nTickBase( ) ) - g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer );
+			const float flFoot = g_ServerAnimations.m_uServerAnimations.m_flFootYaw;
+			const float flFlickTarget = GetFlickYaw( pLocal );
+
+			if( !g_ServerAnimations.m_uServerAnimations.m_bFirstFlick && nSinceExpire < nDelayTicks &&
+				fabsf( Math::AngleDiff( flFlickTarget, flFoot ) ) > 35.f + 100.f * TICKS_TO_TIME( 2 ) ) {
+				// ApproachAngle( target, value, speed ): от ног на 25° в сторону от угла флика
+				pCmd->viewangles.y = Math::ApproachAngle( flFlickTarget + 180.f, flFoot, 25.f );
+				bDelayedFlick = true;
+			}
+			else {
+				nDelayTicks = RandomInt( 0, 3 ) * 2; // анимация стоя каждые 2 тика
+			}
 		}
 
-		static bool bFlickNextTick = false;
-		static bool bWasHidingFlick = false;
-
-		if( bFlickThisTick ) {
+		if( bDelayedFlick ) {
+			// флик не делаем, таймер и флаги не трогаем.
+			// команда останется зачоканной правилом чока 1 ниже, в сеть ничего не уйдёт.
+		}
+		else if( bFlickThisTick ) {
+			m_bLbyUpdateThisTick = true;
 			g_AntiAim.m_bHidingLBYFlick = false;
 
-			if( m_bDistorting ) {
-				// break lby "away" from the target/threat player,
-				// except we only allow significant (>45deg) changes, to prevent
-				// getting tapped with a slight mouse movement
-				pCmd->viewangles.y = flWantedBody;
+			pCmd->viewangles.y = GetFlickYaw( pLocal );
+			if( g_pClientState->m_nChokedCommands( ) < 1 && !g_Vars.globals.m_bFakeWalking )
+				*bSendPacket = false; // флик - первая команда пачки, её и анимирует сервер
 
-				static bool bSwitchSide = false;
-				bSwitchSide = !bSwitchSide;
+			static bool bSwitchSide = false;
+			bSwitchSide = !bSwitchSide;
 
-				RandomSeed( g_pGlobalVars->tickcount );
-				m_flRandDistortFactor = RandomFloat( 10.f, 80.f );
-				RandomSeed( g_pGlobalVars->tickcount + 1 );
-				m_flRandDistortSpeed = RandomFloat( 2.5f, 12.5f );
+			RandomSeed( g_pGlobalVars->tickcount );
+			m_flRandDistortFactor = RandomFloat( 10.f, 80.f );
+			RandomSeed( g_pGlobalVars->tickcount + 1 );
+			m_flRandDistortSpeed = RandomFloat( 2.5f, 12.5f );
 
-				if( g_Vars.rage.anti_aim_distortion_side == 0 ) {
-					if( bSwitchSide ) {
-						m_flRandDistortFactor = fabsf( m_flRandDistortFactor );
-					}
-					else {
-						m_flRandDistortFactor = -fabsf( m_flRandDistortFactor );
-					}
+			if( g_Vars.rage.anti_aim_distortion_side == 0 ) {
+				if( bSwitchSide ) {
+					m_flRandDistortFactor = fabsf( m_flRandDistortFactor );
 				}
 				else {
-					m_flRandDistortFactor = fabsf( m_flRandDistortFactor );
-					if( g_Vars.rage.anti_aim_distortion_side == 1 )
-						m_flRandDistortFactor = -fabsf( m_flRandDistortFactor );
+					m_flRandDistortFactor = -fabsf( m_flRandDistortFactor );
 				}
 			}
 			else {
-				float flRoundedLastMove = Math::AngleNormalize( RoundToMultiple( int( flLastMoveReal ), 45 ) );
-
-
-				PerformBodyFlick( pCmd, bSendPacket, flRoundedLastMove );
+				m_flRandDistortFactor = fabsf( m_flRandDistortFactor );
+				if( g_Vars.rage.anti_aim_distortion_side == 1 )
+					m_flRandDistortFactor = -fabsf( m_flRandDistortFactor );
 			}
 
 			g_ServerAnimations.m_uRenderAnimations.m_bDoingRealFlick = true;
@@ -1225,40 +1281,31 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 			g_AntiAim.m_bHidingLBYFlick = bWasHidingFlick;
 
 			if( bTickBeforeFlick ) {
-				// when breaking under 100 delta, we need the delta between the preflick and the actual flick
-				// to be equal to 100 (as low as possibly) so that we can actually break to the angle we want to
-				if( m_bDistorting ) {
-					const float flTargetAngleToBreakTo = flWantedBody;
-					const float flWhereToPreBreakTo = flTargetAngleToBreakTo + 100.f;
+				// RAX: ноги держатся в пределах eye ± 58. префлик на flick ± ( 116 + approach ) ставит
+				// их минимум в 58 от угла флика -> на флике |foot - eye| > 35 гарантированно.
+				const float flFlickYaw = GetFlickYaw( pLocal );
+				const float flApproach = 100.f * TICKS_TO_TIME( 2 ); // ноги тянутся к LBY 100°/с
+				const float flAdd = 116.f + flApproach;
 
-					pCmd->viewangles.y = flWhereToPreBreakTo;
+				const float flA = Math::AngleNormalize( flFlickYaw - flAdd );
+				const float flB = Math::AngleNormalize( flFlickYaw + flAdd );
 
-					g_AntiAim.m_flLastPrebrakeAngle = pCmd->viewangles.y;
-				}
-				else {
-					/*if( g_Vars.rage.anti_aim_twist ) {
-						pCmd->viewangles.y = flLastMoveReal + 101.f;
-					}
-					else*/ {
-						float flDeltaFrom100 = fabs( g_Vars.rage.anti_aim_fake_body_amount - 100 );
-
-						float flAngleToBreakTo = m_flLastRealAngle - flDeltaFrom100;
-
-						if( m_eBreakerSide == ESide::SIDE_RIGHT ) {
-							flDeltaFrom100 = fabs( g_Vars.rage.anti_aim_fake_body_amount + 235.f );
-							flAngleToBreakTo = m_flLastRealAngle - flDeltaFrom100;;
-						}
-
-						if( g_Vars.rage.anti_aim_fake_body_amount <= 100.f )
-							pCmd->viewangles.y = flAngleToBreakTo;
-					}
-				}
+				// как в RAX: дальняя от последнего анимированного угла сторона
+				const float flAnimYaw = g_ServerAnimations.m_uServerAnimations.m_flEyeYaw;
+				pCmd->viewangles.y = fabsf( Math::AngleDiff( flA, flAnimYaw ) ) > fabsf( Math::AngleDiff( flB, flAnimYaw ) ) ? flA : flB;
+				g_AntiAim.m_flLastPrebrakeAngle = pCmd->viewangles.y;
 
 				g_ServerAnimations.m_uRenderAnimations.m_bDoingPreFlick = true;
 				m_bLbyUpdateThisTick = true;
 			}
 		}
 	}
+
+	// RAX: стоя чок больше 1 не нужен ( сетевой eye = LBY, сервер анимирует первую команду ).
+	// пачки по 2 делают тайминг флика и префлика детерминированным.
+	if( ( pLocal->m_fFlags( ) & FL_ONGROUND ) && pLocal->m_PlayerAnimState( )->m_flVelocityLengthXY <= 0.1f &&
+		!g_Vars.globals.m_bFakeWalking && !g_Vars.globals.m_bRunningExploit )
+		*bSendPacket = g_pClientState->m_nChokedCommands( ) >= 1;
 
 	m_bLastPacket = *bSendPacket;
 	pCmd->viewangles.y = Math::AngleNormalize( pCmd->viewangles.y );
