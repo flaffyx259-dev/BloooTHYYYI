@@ -14,6 +14,14 @@
 
 AntiAim g_AntiAim;
 
+namespace {
+	bool InitialOnGround( C_CSPlayer *pLocal ) {
+		const auto pData = g_Prediction.get_initial_vars( );
+		return pData ? ( pData->flags & FL_ONGROUND ) != 0
+		             : ( pLocal->m_fFlags( ) & FL_ONGROUND ) != 0;
+	}
+}
+
 // #define DMG_BASED_FREESTAND
 
 C_CSPlayer *AntiAim::GetBestPlayer( bool distance ) {
@@ -80,158 +88,198 @@ float AntiAim::UpdateFreestandPriority( float flLength, int nIndex, bool bDogshi
 	return flReturn;
 }
 
+namespace {
+	struct FreestandThreat_t {
+		Vector m_vecEye;
+		float  m_flWeight;
+	};
+
+	struct FreestandCandidate_t {
+		float m_flRel;      // смещение от направления на главного врага
+		float m_flScore;
+		bool  m_bExposed;   // голову в этой точке видит хотя бы один враг
+	};
+
+	// то же "толщина укрытия", но сначала один TraceRay: чистый луч -> голова открыта,
+	// без сотен GetPointContents. шагаем только от первого попадания до головы.
+	// само попадание считаем всегда - проп ( ящик, дверь ) не виден WorldOnly-contents.
+	float MeasureCover( const Vector &vecStart, const Vector &vecEnd ) {
+		constexpr float flStep = 4.f;
+
+		Vector vecDir = vecEnd - vecStart;
+		const float flLen = vecDir.Normalize( );
+		if( flLen <= 0.f )
+			return 0.f;
+
+		CTraceFilterWorldAndPropsOnly filter;
+		CGameTrace tr;
+		g_pEngineTrace->TraceRay( Ray_t( vecStart, vecEnd ), MASK_SHOT_HULL, ( ITraceFilter * )&filter, &tr );
+
+		if( tr.fraction >= 1.f && !tr.startsolid )
+			return 0.f;
+
+		const float flHit = tr.startsolid ? 0.f : flLen * tr.fraction;
+
+		float flCover = flStep * g_AntiAim.UpdateFreestandPriority( flLen, static_cast< int >( flHit ) );
+
+		for( float i = flHit + flStep; i < flLen; i += flStep ) {
+			const Vector vecPoint = vecStart + vecDir * i;
+			if( !( g_pEngineTrace->GetPointContents_WorldOnly( vecPoint, MASK_SHOT_HULL ) & MASK_SHOT_HULL ) )
+				continue;
+
+			flCover += flStep * g_AntiAim.UpdateFreestandPriority( flLen, static_cast< int >( i ) );
+		}
+
+		return flCover;
+	}
+
+	ESide SideFromRel( float flRel ) {
+		if( flRel > 45.f && flRel < 135.f )
+			return SIDE_LEFT;
+		if( flRel < -45.f && flRel > -135.f )
+			return SIDE_RIGHT;
+		return SIDE_BACK;
+	}
+}
+
 void AntiAim::AutoDirection( C_CSPlayer *pLocal ) {
 	if( GetSide( ) != SIDE_MAX )
 		return;
 
-	// constants.
-	const float flXored4 = ( 4.f );
-	const float flXored32 = ( 32.f );
-	const float flXored90 = ( 90.f );
+	constexpr float flHeadRadius   = 32.f;  // грубая оценка положения головы, как раньше
+	constexpr float flLead         = 0.2f;  // упреждение позиции врага ( сек ), подстраивается
+	constexpr float flExposedCost  = 64.f;  // штраф за открытость одному врагу ( = 16 шагов укрытия )
+	constexpr float flSwitchMargin = 16.f;
+	constexpr float flMinHoldTime  = 0.2f;
 
-	// get our view angles.
-	QAngle view_angles;
-	g_pEngine->GetViewAngles( view_angles );
+	const Vector vecLocalEye = pLocal->GetEyePosition( );
 
-	// get our shoot pos.
-	Vector local_start = pLocal->GetEyePosition( );
-
-	// best target.
-	struct AutoTarget_t { float fov; C_CSPlayer *player; };
-	AutoTarget_t target{ 180.f + 1.f, nullptr };
-
-	// note; a DoEdgeAntiAim call used to run here and its result was discarded
-	// (the consuming condition was commented out, and angEdgeAngle was left
-	// uninitialized when no wall was found). dropped it - Think already calls
-	// DoEdgeAntiAim separately and uses the result there.
-
-	// iterate players.
-	target.player = GetBestPlayer( );
-
-	if( !target.player ) {
-		// set angle to backwards.
+	C_CSPlayer *pMain = GetBestPlayer( true );
+	if( !pMain ) {
 		m_flAutoYaw = -1.f;
 		m_flAutoDist = -1.f;
+		m_flAutoRelYaw = 180.f;
 		m_bHasValidAuto = false;
-		m_eAutoSide = ESide::SIDE_BACK;
+		m_eAutoSide = SIDE_BACK;
 		return;
 	}
 
-	// get target away angle.
-	QAngle away = Math::CalcAngle( target.player->m_vecOrigin( ), pLocal->m_vecOrigin( ) );
+	const float flAway = Math::CalcAngle( pMain->m_vecOrigin( ), pLocal->m_vecOrigin( ) ).y;
 
-	// construct vector of angles to test.
-	std::vector< AdaptiveAngle > angles{ };
-	if( !g_Vars.globals.m_bRunningExploit )
-		angles.emplace_back( 180.f );
-	angles.emplace_back( flXored90 );
-	angles.emplace_back( -flXored90 );
-
-	// start the trace at the enemy shoot pos.
-	Vector start = target.player->GetEyePosition( );
-
-	// see if we got any valid result.
-	// if this is false the path was not obstructed with anything.
-	bool valid{ false };
-
-	// iterate vector of angles.
-	for( auto it = angles.begin( ); it != angles.end( ); ++it ) {
-
-		// compute the 'rough' estimation of where our head will be.
-		Vector end{ local_start.x + std::cos( DEG2RAD( away.y + it->m_yaw ) ) * flXored32,
-			local_start.y + std::sin( DEG2RAD( away.y + it->m_yaw ) ) * flXored32,
-			local_start.z };
-
-		// compute the direction.
-		Vector dir = end - start;
-		float len = dir.Normalize( );
-
-		// should never happen.
-		if( len <= 0.f )
+	// все враги, с упреждением: сторона выбирается под будущий пик,
+	// а не под точку, с которой он уже ушёл.
+	std::vector< FreestandThreat_t > vecThreats;
+	for( int i = 1; i <= g_pGlobalVars->maxClients; i++ ) {
+		auto player = C_CSPlayer::GetPlayerByIndex( i );
+		if( !player || player->IsDead( ) || player->IsDormant( ) || player->IsTeammate( pLocal ) )
 			continue;
 
-		// step thru the total distance, 4 units per step.
-		for( float i{ 0.f }; i < len; i += flXored4 ) {
-			// get the current step position.
-			Vector point = start + ( dir * i );
+		if( g_PlayerList.GetSettings( player->GetSteamID( ) ).m_bAddToWhitelist && !g_Vars.misc.force_ignore_whitelist.enabled )
+			continue;
 
-			// get the contents at this point.
-			int contents = g_pEngineTrace->GetPointContents_WorldOnly( point, MASK_SHOT_HULL );
+		Vector vecEye = player->GetEyePosition( );
 
-			// contains nothing that can stop a bullet.
-			if( !( contents & MASK_SHOT_HULL ) )
-				continue;
+		Vector vecVel = player->m_vecVelocity( );
+		vecVel.z = 0.f;
+		if( vecVel.Length2D( ) > 1.f ) {
+			CTraceFilterWorldAndPropsOnly filter;
+			CGameTrace tr;
+			g_pEngineTrace->TraceRay( Ray_t( vecEye, vecEye + vecVel * flLead ), MASK_SHOT_HULL, ( ITraceFilter * )&filter, &tr );
 
-			// append 'penetrated distance'.
-			// note; the step index is explicitly narrowed, it used to be an
-			// implicit float -> int conversion.
-			it->m_dist += ( flXored4 * UpdateFreestandPriority( len, static_cast< int >( i ) ) );
+			// не упираемся вплотную в стену, иначе следующий трейс начнётся в solid.
+			vecEye += ( tr.endpos - vecEye ) * 0.9f;
+		}
 
-			// mark that we found anything.
-			valid = true;
+		const float flDist = ( player->m_vecOrigin( ) - pLocal->m_vecOrigin( ) ).Length( );
+
+		// ближние опаснее: 1.0 до 512 юнитов, дальше спадает, но не ниже 0.25.
+		float flWeight = 512.f / ( flDist > 1.f ? flDist : 1.f );
+		if( flWeight > 1.f )  flWeight = 1.f;
+		if( flWeight < 0.25f ) flWeight = 0.25f;
+
+		vecThreats.push_back( { vecEye, flWeight } );
+	}
+
+	std::vector< FreestandCandidate_t > vecCandidates;
+	if( !g_Vars.globals.m_bRunningExploit )
+		vecCandidates.push_back( { 180.f, 0.f, false } );
+	vecCandidates.push_back( { 90.f, 0.f, false } );
+	vecCandidates.push_back( { -90.f, 0.f, false } );
+
+	bool bAnyCover = false;
+	for( auto &cand : vecCandidates ) {
+		const float flRad = DEG2RAD( flAway + cand.m_flRel );
+		const Vector vecHead{ vecLocalEye.x + std::cos( flRad ) * flHeadRadius,
+			vecLocalEye.y + std::sin( flRad ) * flHeadRadius,
+			vecLocalEye.z };
+
+		for( const auto &threat : vecThreats ) {
+			const float flCover = MeasureCover( threat.m_vecEye, vecHead );
+			if( flCover > 0.f ) {
+				cand.m_flScore += flCover * threat.m_flWeight;
+				bAnyCover = true;
+			}
+			else {
+				// открыт хотя бы одному - сильный штраф, укрытие от другого это не перекроет.
+				cand.m_flScore -= flExposedCost * threat.m_flWeight;
+				cand.m_bExposed = true;
+			}
 		}
 	}
 
-	if( !valid /*|| !bEdgeDetected*/ ) {
-		// set angle to backwards.
-		m_flAutoYaw = Math::AngleNormalize( away.y + 180.f );
+	// укрытия нет нигде -> назад.
+	if( !bAnyCover ) {
+		m_flAutoRelYaw = 180.f;
+		m_flAutoYaw = Math::AngleNormalize( flAway + 180.f );
+		m_flAutoDist = 0.f;
 		m_flAutoTime = -1.f;
 		m_bHasValidAuto = true;
-		m_eAutoSide = ESide::SIDE_BACK;
+		m_eAutoSide = SIDE_BACK;
 		return;
 	}
 
-	// put the most distance at the front of the container.
-	std::sort( angles.begin( ), angles.end( ),
-			   [ ] ( const AdaptiveAngle &a, const AdaptiveAngle &b ) {
-		return a.m_dist > b.m_dist;
-	} );
+	// max_element возвращает первый максимум -> при равенстве побеждает back ( он первый ).
+	const auto itBest = std::max_element( vecCandidates.begin( ), vecCandidates.end( ),
+		[ ] ( const FreestandCandidate_t &a, const FreestandCandidate_t &b ) {
+			return a.m_flScore < b.m_flScore;
+		} );
 
-	// the best angle should be at the front now.
-	AdaptiveAngle *best = &angles.front( );
-
-	// how long has passed sinec we've updated our angles?
-	float last_update_time = g_pGlobalVars->curtime - m_flAutoTime;
-
-	// note; this used to be an exact float inequality against an accumulated
-	// distance, which let the chosen side flip every single tick. require the
-	// new candidate to beat the stored one by a meaningful margin, and hold the
-	// current side for a minimum time before switching away from it.
-	constexpr float flSwitchMargin = 16.f;  // 4 ray-march steps worth of cover.
-	constexpr float flMinHoldTime = 0.2f;
-
-	// no side picked yet (or we just came back from the no-cover fallback,
-	// which parks m_flAutoTime at -1) -> take the best result immediately.
-	const bool bNoCurrentSide = !m_bHasValidAuto || m_flAutoTime < 0.f;
-
-	// meaningfully more cover than what we currently sit behind.
-	const bool bClearlyBetter = ( best->m_dist - m_flAutoDist ) > flSwitchMargin;
-
-	// our current side lost cover; allow following it down so we don't stay
-	// committed to an angle that is no longer covered.
-	const bool bCurrentGotWorse = ( m_flAutoDist - best->m_dist ) > flSwitchMargin;
-
-	if( bNoCurrentSide || ( ( bClearlyBetter || bCurrentGotWorse ) && last_update_time >= flMinHoldTime ) ) {
-		auto TranslateSide = [&] ( float a ) {
-			if( a <= -flXored90 ) {
-				return ESide::SIDE_RIGHT;
+	// СВЕЖАЯ оценка текущей стороны в этом тике, а не сохранённая при выборе.
+	const FreestandCandidate_t *pCurrent = nullptr;
+	if( m_bHasValidAuto && m_flAutoTime >= 0.f ) {
+		for( const auto &cand : vecCandidates ) {
+			if( fabsf( Math::AngleDiff( cand.m_flRel, m_flAutoRelYaw ) ) < 1.f ) {
+				pCurrent = &cand;
+				break;
 			}
-
-			if( a >= flXored90 ) {
-				return ESide::SIDE_LEFT;
-			}
-
-			return ESide::SIDE_BACK;
-		};
-
-		// set yaw to the best result.
-		m_eAutoSide = TranslateSide( best->m_yaw );
-		m_flAutoYaw = Math::AngleNormalize( away.y + best->m_yaw );
-		m_flAutoDist = best->m_dist;
-		m_flAutoTime = g_pGlobalVars->curtime;
-		m_bHasValidAuto = true;
+		}
 	}
 
+	bool bSwitch = false;
+	if( !pCurrent ) {
+		bSwitch = true;
+	}
+	else if( &*itBest != pCurrent ) {
+		// текущая сторона открылась, а лучшая закрыта -> уходим сразу, без hold time.
+		const bool bEscape = pCurrent->m_bExposed && !itBest->m_bExposed;
+		const bool bClearlyBetter = ( itBest->m_flScore - pCurrent->m_flScore ) > flSwitchMargin;
+		const bool bHeldEnough = ( g_pGlobalVars->curtime - m_flAutoTime ) >= flMinHoldTime;
+
+		bSwitch = bEscape || ( bClearlyBetter && bHeldEnough );
+	}
+
+	if( bSwitch ) {
+		m_flAutoRelYaw = itBest->m_flRel;
+		m_flAutoTime = g_pGlobalVars->curtime;
+	}
+
+	const FreestandCandidate_t &chosen = bSwitch ? *itBest : *pCurrent;
+	m_flAutoDist = chosen.m_flScore;
+
+	// абсолютный угол пересчитывается КАЖДЫЙ тик от текущей позиции врага.
+	m_flAutoYaw = Math::AngleNormalize( flAway + m_flAutoRelYaw );
+	m_eAutoSide = SideFromRel( m_flAutoRelYaw );
+	m_bHasValidAuto = true;
 }
 
 bool AntiAim::DoEdgeAntiAim( C_CSPlayer *player, QAngle &out ) {
@@ -323,7 +371,7 @@ void AntiAim::DoRealYaw( CUserCmd *pCmd, C_CSPlayer *pLocal ) {
 			// fix it to one float
 			static float currentAng = startPoint;
 
-			bool bOnGround = ( pLocal->m_fFlags( ) & FL_ONGROUND ) || ( g_Prediction.get_initial_vars( )->flags & FL_ONGROUND );
+			bool bOnGround = ( pLocal->m_fFlags( ) & FL_ONGROUND ) || InitialOnGround( pLocal );
 			if( !bOnGround ) {
 				// increment it if we're in air
 				currentAng += 5.0f;
@@ -361,8 +409,8 @@ void AntiAim::DoRealYaw( CUserCmd *pCmd, C_CSPlayer *pLocal ) {
 
 			float flNewAngle = flLowerBodyYawTarget + ( bSwapSide ? 135.f : -135.f );
 
-			const bool bOnGround = ( pLocal->m_fFlags( ) & FL_ONGROUND ) || ( g_Prediction.get_initial_vars( )->flags & FL_ONGROUND );
-			const bool bInAir = ( !( pLocal->m_fFlags( ) & FL_ONGROUND ) || !( g_Prediction.get_initial_vars( )->flags & FL_ONGROUND ) || ( pCmd->buttons & IN_JUMP ) );
+			const bool bOnGround = ( pLocal->m_fFlags( ) & FL_ONGROUND ) || InitialOnGround( pLocal );
+			const bool bInAir = ( !( pLocal->m_fFlags( ) & FL_ONGROUND ) || !InitialOnGround( pLocal ) || ( pCmd->buttons & IN_JUMP ) );
 
 			// get our last moving angle (resolvers might compare to this)
 			if( !bInAir && pLocal->m_PlayerAnimState( )->m_flVelocityLengthXY > 0.1f )
@@ -438,13 +486,16 @@ void AntiAim::DoFakeYaw( CUserCmd *pCmd, C_CSPlayer *pLocal ) {
 
 			// apply jitter.
 			pCmd->viewangles.y += RandomFloat( -range, range );
+
+			// при range > 90 фейк мог встать прямо на реал.
+			pCmd->viewangles.y = KeepAwayFromBody( pCmd->viewangles.y, m_flLastRealAngle, 90.f );
 			break;
 		}
 		case 4:
 			pCmd->viewangles.y = m_flLastRealAngle + 90.f + std::fmod( g_pGlobalVars->curtime * 360.f, 180.f );
 			break;
 		case 5:
-			pCmd->viewangles.y = RandomFloat( -180.f, 180.f );
+			pCmd->viewangles.y = KeepAwayFromBody( RandomFloat( -180.f, 180.f ), m_flLastRealAngle, 90.f );
 			break;
 		case 6: {
 			// RAX: в сетевые eye angles уходит LBY. противник его и так видит -> ноль новой
@@ -566,7 +617,7 @@ void AntiAim::HandleManual( CUserCmd *pCmd, C_CSPlayer *pLocal ) {
 		m_eSide = SIDE_MAX;
 	}
 
-	const bool bInAir = ( !( pLocal->m_fFlags( ) & FL_ONGROUND ) || !( g_Prediction.get_initial_vars( )->flags & FL_ONGROUND ) || ( pCmd->buttons & IN_JUMP ) );
+	const bool bInAir = ( !( pLocal->m_fFlags( ) & FL_ONGROUND ) || !InitialOnGround( pLocal ) || ( pCmd->buttons & IN_JUMP ) );
 	if( g_Vars.rage.disable_anti_aim_manual_air && bInAir )
 		return;
 
@@ -962,6 +1013,12 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 	const bool bTickBeforeFlick = !bFlickThisTick &&
 		( TICKS_TO_TIME( pLocal->m_nTickBase( ) ) + TICKS_TO_TIME( 2 ) ) > g_ServerAnimations.m_uServerAnimations.m_flLowerBodyRealignTimer;
 
+	// RAX: стоя пачки по 2. решаем ДО выбора ветки реал/фейк, иначе при фейклаге > 1
+	// реал-команда становилась отправляемой и в сеть уходил реал вместо LBY.
+	if( ( pLocal->m_fFlags( ) & FL_ONGROUND ) && pLocal->m_PlayerAnimState( )->m_flVelocityLengthXY <= 0.1f &&
+		!g_Vars.globals.m_bFakeWalking && !g_Vars.globals.m_bRunningExploit )
+		*bSendPacket = g_pClientState->m_nChokedCommands( ) >= 1;
+
 	static QAngle angLastAngle = pCmd->viewangles;
 	if( !*bSendPacket || !*bFinalPacket || g_AntiAim.m_bHasOverriden ) {
 		HandleManual( pCmd, pLocal );
@@ -1015,7 +1072,7 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 		// angle towards the player is conveniently
 		// also the angle we would be at if our head 
 		// was in the wall, so let's stick it in the wall
-		if( bEdgeDetected && flTowards != FLT_MAX && fabsf( Math::AngleDiff( flTowards, angEdgeAngle.y ) < 5.f ) )
+		if( bEdgeDetected && flTowards != FLT_MAX && fabsf( Math::AngleDiff( flTowards, angEdgeAngle.y ) ) < 5.f )
 			flWantedBody = Math::AngleNormalize( RoundToMultiple( int( angEdgeAngle.y ), 45 ) );
 
 		if( !g_Vars.rage.anti_aim_lock_angle_key.enabled )
@@ -1061,34 +1118,47 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 		// they headshout us due to spread or just luck lawl)
 		if( m_bDistorting ) {
 			if( bBreakMove && ( flMoveDelta < ( 1.1f * 2.f ) || g_ServerAnimations.m_uServerAnimations.m_bFirstFlick ) ) {
-				pCmd->viewangles.y = flLastMoveBody + 180.f;
-
-				float flAdditive = std::fmod( g_pGlobalVars->curtime * ( m_flRandDistortFactor * m_flRandDistortSpeed ), 120.f );
-				if( fabsf( Math::AngleDiff( flAdditive, 120.f ) ) < 5.f ) {
-					static bool bSwitchSide = false;
-					bSwitchSide = !bSwitchSide;
-
-					RandomSeed( g_pGlobalVars->tickcount );
-					m_flRandDistortFactor = RandomFloat( 10.f, 80.f );
-					RandomSeed( g_pGlobalVars->tickcount + 1 );
-					m_flRandDistortSpeed = RandomFloat( 2.5f, 12.5f );
-
-					if( bSwitchSide ) {
-						m_flRandDistortFactor = fabsf( m_flRandDistortFactor );
-					}
-					else {
-						m_flRandDistortFactor = -fabsf( m_flRandDistortFactor );
-					}
-
-					flAdditive = std::fmod( g_pGlobalVars->curtime * ( m_flRandDistortFactor * m_flRandDistortSpeed ), 120.f );
+				if( m_bEdgeYawApplied || m_bAutoYawApplied ) {
+					// голова за стеной: не выносим её на +180 от движения ( это может быть
+					// открытая сторона ), держим угол укрытия, но не ближе 100 к LBY движения.
+					pCmd->viewangles.y = KeepAwayFromBody( pCmd->viewangles.y, flLastMoveBody, 100.f );
 				}
+				else {
+					pCmd->viewangles.y = flLastMoveBody + 180.f;
 
-				pCmd->viewangles.y += flAdditive;
+					float flAdditive = std::fmod( g_pGlobalVars->curtime * ( m_flRandDistortFactor * m_flRandDistortSpeed ), 120.f );
+					if( fabsf( Math::AngleDiff( flAdditive, 120.f ) ) < 5.f ) {
+						static bool bSwitchSide = false;
+						bSwitchSide = !bSwitchSide;
 
+						RandomSeed( g_pGlobalVars->tickcount );
+						m_flRandDistortFactor = RandomFloat( 10.f, 80.f );
+						RandomSeed( g_pGlobalVars->tickcount + 1 );
+						m_flRandDistortSpeed = RandomFloat( 2.5f, 12.5f );
+
+						if( bSwitchSide ) {
+							m_flRandDistortFactor = fabsf( m_flRandDistortFactor );
+						}
+						else {
+							m_flRandDistortFactor = -fabsf( m_flRandDistortFactor );
+						}
+
+						flAdditive = std::fmod( g_pGlobalVars->curtime * ( m_flRandDistortFactor * m_flRandDistortSpeed ), 120.f );
+					}
+
+					pCmd->viewangles.y += flAdditive;
+				}
 			}
 			else if( !g_ServerAnimations.m_uServerAnimations.m_bFirstFlick && bEnsureBreaking ) {
-				// add random shit to aa lawl
-				pCmd->viewangles.y += std::fmodf( g_pGlobalVars->curtime * ( m_flRandDistortFactor * m_flRandDistortSpeed ), 360.f );
+				const float flPhase = std::fmodf( g_pGlobalVars->curtime * ( m_flRandDistortFactor * m_flRandDistortSpeed ), 360.f );
+
+				if( m_bEdgeYawApplied || m_bAutoYawApplied ) {
+					// голова за стеной: качаем ±30 вокруг угла freestand/edge, а не крутим 360.
+					pCmd->viewangles.y += 30.f * std::sin( DEG2RAD( flPhase ) );
+				}
+				else {
+					pCmd->viewangles.y += flPhase;
+				}
 			}
 		}
 
@@ -1098,7 +1168,7 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 			!g_ServerAnimations.m_uServerAnimations.m_bFirstFlick && !m_bClimbingLadder && !g_Vars.globals.m_bFakeWalking )
 			pCmd->viewangles.y = KeepAwayFromBody( pCmd->viewangles.y, pLocal->m_flLowerBodyYawTarget( ), 100.f );
 
-		DesyncLastMove( pCmd, nullptr );
+		DesyncLastMove( pCmd, bSendPacket );
 
 		auto pUnpredictedData = g_Prediction.get_initial_vars( );
 		if( pUnpredictedData ) {
@@ -1112,7 +1182,7 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 			// initial mode
 			if( g_Vars.rage.anti_aim_desync_land_first || bForceDesync ) {
 				// 2 consecutive ticks on ground, allow initial desync
-				if( ( pLocal->m_fFlags( ) & FL_ONGROUND ) && ( pUnpredictedData->flags & FL_ONGROUND ) || bForceDesync ) {
+				if( ( ( pLocal->m_fFlags( ) & FL_ONGROUND ) && ( pUnpredictedData->flags & FL_ONGROUND ) ) || bForceDesync ) {
 					bPerformDesync = true;
 
 					// place lby 135 deg away from last  
@@ -1124,7 +1194,7 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 			static float flAttemptedLBY = 0.f;
 			if( bPerformDesync || bForceDesync ) {
 				// we've successfully desynced our lby, no need to continue
-				if( pLocal->m_flLowerBodyYawTarget( ) == Math::AngleNormalize( flTargetLBY ) ) {
+				if( fabsf( Math::AngleDiff( pLocal->m_flLowerBodyYawTarget( ), flTargetLBY ) ) < 1.5f ) {
 					bPerformDesync = false;
 				}
 
@@ -1147,7 +1217,8 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 						bDesyncLand = false;
 					}
 
-					if( pLocal->m_fFlags( ) != fPredictedFlags ) {
+					// приземление = в предсказании появился FL_ONGROUND.
+					if( !( pLocal->m_fFlags( ) & FL_ONGROUND ) && ( fPredictedFlags & FL_ONGROUND ) ) {
 						pCmd->viewangles.y = flAttemptedLBY = flTargetLBY;
 						*bSendPacket = true;
 
@@ -1157,7 +1228,7 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 			}
 
 			g_AntiAim.m_bLandDesynced =
-				( !bOnGround || g_InputSystem.IsKeyDown( VK_SPACE ) ) && fabsf( Math::AngleDiff( pLocal->m_flLowerBodyYawTarget( ), Math::AngleNormalize( flAttemptedLBY ) ) ) < 1.5f;
+				( !bOnGround || ( pCmd->buttons & IN_JUMP ) ) && fabsf( Math::AngleDiff( pLocal->m_flLowerBodyYawTarget( ), Math::AngleNormalize( flAttemptedLBY ) ) ) < 1.5f;
 
 		}
 
@@ -1171,8 +1242,15 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 		angViewangle = pCmd->viewangles;
 	}
 	else {
-		if( !g_Vars.globals.m_bRunningExploit )
+		if( !g_Vars.globals.m_bRunningExploit ) {
 			DoFakeYaw( pCmd, pLocal );
+
+			// стоя схема флика рассчитана на LBY в сетевой команде ( case 6 ).
+			// другой фейк стоя сервер тоже анимирует -> ноги тянутся за ним.
+			if( g_Vars.rage.anti_aim_fake_body && ( pLocal->m_fFlags( ) & FL_ONGROUND ) &&
+				pLocal->m_PlayerAnimState( )->m_flVelocityLengthXY <= 0.1f && !g_Vars.globals.m_bFakeWalking )
+				pCmd->viewangles.y = pLocal->m_flLowerBodyYawTarget( );
+		}
 	}
 
 	float flYawToAddTo = g_Vars.rage.anti_aim_lock_angle_key.enabled ? angLastAngle.y : pCmd->viewangles.y;
@@ -1241,7 +1319,20 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 			m_bLbyUpdateThisTick = true;
 			g_AntiAim.m_bHidingLBYFlick = false;
 
-			pCmd->viewangles.y = GetFlickYaw( pLocal );
+			float flFlickYaw = GetFlickYaw( pLocal );
+
+			// флик сработает только при |foot - eye| > 35. если ноги слишком близко к цели,
+			// таймер ниже всё равно уедет на +1.1, а у сервера он останется истёкшим ->
+			// LBY уйдёт в первую подходящую команду, возможно в реал. поэтому флик в запасной
+			// угол: 60 от ног ( ноги ужмутся до eye ± 58, это > 35 ), на стороне от реала.
+			const float flFootNow = g_ServerAnimations.m_uServerAnimations.m_flFootYaw;
+			constexpr float flFlickMargin = 35.f + 10.f;
+			if( fabsf( Math::AngleDiff( flFlickYaw, flFootNow ) ) <= flFlickMargin ) {
+				const float flRealSide = Math::AngleDiff( m_flLastRealAngle, flFootNow );
+				flFlickYaw = Math::AngleNormalize( flFootNow + ( flRealSide >= 0.f ? -60.f : 60.f ) );
+			}
+
+			pCmd->viewangles.y = flFlickYaw;
 			if( g_pClientState->m_nChokedCommands( ) < 1 && !g_Vars.globals.m_bFakeWalking )
 				*bSendPacket = false; // флик - первая команда пачки, её и анимирует сервер
 
@@ -1290,9 +1381,15 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 				const float flA = Math::AngleNormalize( flFlickYaw - flAdd );
 				const float flB = Math::AngleNormalize( flFlickYaw + flAdd );
 
-				// как в RAX: дальняя от последнего анимированного угла сторона
-				const float flAnimYaw = g_ServerAnimations.m_uServerAnimations.m_flEyeYaw;
-				pCmd->viewangles.y = fabsf( Math::AngleDiff( flA, flAnimYaw ) ) > fabsf( Math::AngleDiff( flB, flAnimYaw ) ) ? flA : flB;
+				// обе стороны дают ноги >= 58 от угла флика, выбор свободный.
+				// голова за стеной -> сторона ближе к укрытию, иначе как раньше.
+				if( m_flEdgeOrAutoYaw != FLT_MAX ) {
+					pCmd->viewangles.y = fabsf( Math::AngleDiff( flA, m_flEdgeOrAutoYaw ) ) < fabsf( Math::AngleDiff( flB, m_flEdgeOrAutoYaw ) ) ? flA : flB;
+				}
+				else {
+					const float flAnimYaw = g_ServerAnimations.m_uServerAnimations.m_flEyeYaw;
+					pCmd->viewangles.y = fabsf( Math::AngleDiff( flA, flAnimYaw ) ) > fabsf( Math::AngleDiff( flB, flAnimYaw ) ) ? flA : flB;
+				}
 				g_AntiAim.m_flLastPrebrakeAngle = pCmd->viewangles.y;
 
 				g_ServerAnimations.m_uRenderAnimations.m_bDoingPreFlick = true;
@@ -1300,12 +1397,6 @@ void AntiAim::Think( CUserCmd *pCmd, bool *bSendPacket, bool *bFinalPacket ) {
 			}
 		}
 	}
-
-	// RAX: стоя чок больше 1 не нужен ( сетевой eye = LBY, сервер анимирует первую команду ).
-	// пачки по 2 делают тайминг флика и префлика детерминированным.
-	if( ( pLocal->m_fFlags( ) & FL_ONGROUND ) && pLocal->m_PlayerAnimState( )->m_flVelocityLengthXY <= 0.1f &&
-		!g_Vars.globals.m_bFakeWalking && !g_Vars.globals.m_bRunningExploit )
-		*bSendPacket = g_pClientState->m_nChokedCommands( ) >= 1;
 
 	m_bLastPacket = *bSendPacket;
 	pCmd->viewangles.y = Math::AngleNormalize( pCmd->viewangles.y );

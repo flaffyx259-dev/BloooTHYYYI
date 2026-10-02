@@ -56,6 +56,7 @@ private:
 	ESide m_eAutoSide;
 	float m_flAutoYaw;
 	float m_flAutoDist;
+	float m_flAutoRelYaw = 180.f; // выбранная сторона относительно направления на врага
 	float m_flAutoTime;
 	int  m_nBodyFlicks;
 	bool m_bJitterUpdate;
